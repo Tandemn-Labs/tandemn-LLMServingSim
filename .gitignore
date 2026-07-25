@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.DS_Store
+
+# Local simulator builds and generated per-run inputs.
+astra-sim/build/*/build/
+astra-sim/inputs/runs/
+
+# Evaluator scratch directories; checked-in example outputs remain tracked.
+outputs/.koi-eval-*/
