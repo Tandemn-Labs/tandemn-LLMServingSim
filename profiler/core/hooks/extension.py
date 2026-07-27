@@ -59,7 +59,8 @@ class Extension:
                 scoped to the category we're profiling (so timings for
                 unrelated layers aren't returned).
             kind: One of ``"dense"``, ``"per_sequence"``, ``"attention"``,
-                ``"moe"``. Used to decide whether to forge MoE routing.
+                ``"linear_attention"``, ``"encoder"``, ``"moe"``. Used to
+                decide whether to forge MoE routing.
             iterations: Number of timed forward passes (averaged via
                 the hook's invocation count). Default 3.
 

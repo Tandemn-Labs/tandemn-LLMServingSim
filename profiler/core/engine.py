@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 from vllm import LLM
+from vllm.config import PoolerConfig
 
 from profiler.core import logger as log
 from profiler.core.config import (
@@ -61,6 +62,7 @@ class RuntimeLimits:
     max_model_len: int
     num_experts: int | None = None
     top_k: int | None = None
+    is_encoder: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -139,16 +141,32 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
     # 1. Defaults + engine scalars (dtype, kv_cache_dtype, ...).
     kwargs = _deep_merge(HOST_ENGINE_DEFAULTS, _profile_engine_overrides(args))
 
+    is_encoder = args.pooler_config is not None
+    if is_encoder and tp != 1:
+        raise ValueError("encoder-only profiling supports tp=1 only")
+
     # 1b. Apply the MNBT bump. After the merge, kwargs["max_num_*"]
     # reflect the logical (user-intended) values; the engine must be
     # booted with room for skew/attention boundary shots that submit
     # up to ``MNBT + MSQ`` tokens in a single scheduler-bypass fire.
     logical_mnbt = int(kwargs["max_num_batched_tokens"])
     logical_msq = int(kwargs["max_num_seqs"])
-    kwargs["max_num_batched_tokens"] = logical_mnbt + logical_msq
+    if is_encoder:
+        max_embed_len = int(
+            args.pooler_config.get("max_embed_len") or logical_mnbt
+        )
+        kwargs["max_model_len"] = min(logical_mnbt, max_embed_len)
+        kwargs["runner"] = "pooling"
+        kwargs["pooler_config"] = PoolerConfig(**args.pooler_config)
+        kwargs.pop("generation_config", None)
+    else:
+        kwargs["max_num_batched_tokens"] = logical_mnbt + logical_msq
 
     # 2. Single-GPU emulation. Actual model= path is set by spin_up.
     kwargs["tensor_parallel_size"] = 1
+    if (args.model_config or {}).get("model_type") == "qwen3_next":
+        # Pinned vLLM rejects Qwen3-Next's default "all" state-cache mode.
+        kwargs["mamba_cache_mode"] = "align"
 
     # 3. Compose hf_overrides:
     #       defaults (num_hidden_layers=1) → CLI → sharded.
@@ -182,12 +200,17 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
                 f"shard field {field_name!r} must be an int; got "
                 f"{type(val).__name__}"
             )
-        if val % tp != 0:
+        if val % tp == 0:
+            sharded_overrides[field_name] = val // tp
+        elif field_name == "num_key_value_heads" and val < tp and tp % val == 0:
+            # vLLM replicates KV heads when TP exceeds their count. A
+            # single local KV head reproduces that rank's kernel shape.
+            sharded_overrides[field_name] = 1
+        else:
             raise ValueError(
                 f"model config field {field_name!r}={val} is not "
                 f"divisible by tp={tp}; cannot TP-shard for profiling"
             )
-        sharded_overrides[field_name] = val // tp
 
     # 5. Sharding wins.
     kwargs["hf_overrides"] = _deep_merge(hf_overrides, sharded_overrides)
@@ -254,9 +277,11 @@ def probe_limits(llm: LLM) -> RuntimeLimits:
     """
     cfg = llm.llm_engine.vllm_config
 
+    is_encoder = cfg.model_config.runner_type == "pooling"
     num_cache_blocks = cfg.cache_config.num_gpu_blocks
     block_size = cfg.cache_config.block_size
-    assert num_cache_blocks is not None, "vLLM did not report num_gpu_blocks"
+    if not is_encoder:
+        assert num_cache_blocks is not None, "vLLM did not report num_gpu_blocks"
 
     # MoE params read from the live HF config (post-override).
     hf_cfg = getattr(cfg.model_config, "hf_text_config", None)
@@ -270,15 +295,18 @@ def probe_limits(llm: LLM) -> RuntimeLimits:
 
     engine_mnbt = cfg.scheduler_config.max_num_batched_tokens
     engine_msq = cfg.scheduler_config.max_num_seqs
-    logical_mnbt = engine_mnbt - engine_msq
+    logical_mnbt = engine_mnbt if is_encoder else engine_mnbt - engine_msq
 
     return RuntimeLimits(
         max_num_batched_tokens=logical_mnbt,
         max_num_seqs=engine_msq,
-        num_cache_tokens=num_cache_blocks * block_size,
+        num_cache_tokens=(
+            logical_mnbt if is_encoder else num_cache_blocks * block_size
+        ),
         max_model_len=cfg.model_config.max_model_len,
         num_experts=num_experts,
         top_k=top_k,
+        is_encoder=is_encoder,
     )
 
 

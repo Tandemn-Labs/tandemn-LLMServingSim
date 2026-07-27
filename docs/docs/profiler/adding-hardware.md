@@ -198,9 +198,8 @@ constant skew correction.
 
 ### What you cannot skip
 
-- `dense.csv`: every model uses dense linears.
-- `per_sequence.csv`: `lm_head` and `sampler` always run.
-- `attention.csv`: every model has attention.
+- Decoder models require `dense.csv`, `per_sequence.csv`, and `attention.csv`.
+- Encoder-only XLM-R models require `dense.csv` and `encoder.csv` instead.
 - `meta.yaml`: without it the simulator can't resolve the variant.
 
 ### Validation

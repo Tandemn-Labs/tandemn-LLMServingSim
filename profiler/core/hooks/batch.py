@@ -107,6 +107,15 @@ class Shot:
             experts={"activated": activated_experts},
         )
 
+    @classmethod
+    def encoder(cls, sequence_length: int, num_sequences: int) -> "Shot":
+        """A batch of equal-length, full-sequence encoder requests."""
+        return cls(requests=[(sequence_length, 0)] * num_sequences)
+
+    @classmethod
+    def encoder_lengths(cls, sequence_lengths: list[int]) -> "Shot":
+        return cls(requests=[(length, 0) for length in sequence_lengths])
+
 
 # ---------------------------------------------------------------------------
 # SchedulerOutput assembly (worker-side)
@@ -135,14 +144,25 @@ def assemble_scheduler_output(shot: Shot, model_runner):
         SchedulerOutput,
     )
 
-    # Greedy single-step sampling — we don't care about token quality,
-    # only about kernel shapes.
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        ignore_eos=True,
-        max_tokens=1,
-    )
+    is_pooling = bool(model_runner.is_pooling_model)
+    if is_pooling:
+        from vllm import PoolingParams
+
+        model = model_runner.get_model()
+        supported_tasks = tuple(model.pooler.get_supported_tasks())
+        task = model_runner.model_config.get_pooling_task(supported_tasks)
+        pooling_params = PoolingParams(task=task)
+        pooling_params.verify(model_runner.model_config)
+        sampling_params = None
+    else:
+        # Greedy single-step sampling — token values do not affect timing.
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            ignore_eos=True,
+            max_tokens=1,
+        )
+        pooling_params = None
 
     # vLLM may have multiple KV-cache groups (cross-layer managers,
     # hybrid architectures). We honor all of them by reading the
@@ -172,9 +192,12 @@ def assemble_scheduler_output(shot: Shot, model_runner):
         # We round up because partial blocks still consume one slot.
         group_block_ids: list[list[int]] = []
         for g, bs in enumerate(block_sizes):
-            num_blocks = math.ceil(total_len / bs) if total_len else 1
-            ids = list(range(block_cursor[g], block_cursor[g] + num_blocks))
-            block_cursor[g] += num_blocks
+            if is_pooling:
+                ids = []
+            else:
+                num_blocks = math.ceil(total_len / bs) if total_len else 1
+                ids = list(range(block_cursor[g], block_cursor[g] + num_blocks))
+                block_cursor[g] += num_blocks
             group_block_ids.append(ids)
 
         scheduled.append(
@@ -186,7 +209,9 @@ def assemble_scheduler_output(shot: Shot, model_runner):
                 prompt_token_ids=[1] * total_len,
                 mm_features=[],
                 sampling_params=sampling_params,
-                pooling_params=None,
+                pooling_params=(
+                    pooling_params.clone() if pooling_params is not None else None
+                ),
                 block_ids=tuple(group_block_ids),
                 # This is the "KV cache already contains `history`
                 # tokens" marker — the crux of how we inject arbitrary

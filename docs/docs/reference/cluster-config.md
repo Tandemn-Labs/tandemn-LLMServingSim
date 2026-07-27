@@ -168,6 +168,19 @@ schema. Top-level structure:
 - Without `dp_group`: `ep_size <= tp_size`
 - For MoE: `ep_size` must divide `num_local_experts`
 
+Encoder-only XLM-R instances have a deliberately narrower contract:
+
+- `num_npus`, `tp_size`, `pp_size`, and `ep_size` must all be `1`.
+- `pd_type` and `dp_group` must be `null`.
+- `dtype` should be `float16` for the FP16 profile matrix and
+  `kv_cache_dtype` must remain `auto`.
+- Prefix caching and chunked prefill are disabled automatically; local/PIM
+  offloading and sub-batch interleaving are rejected.
+- Each request must fit the model limit (512 tokens for multilingual E5,
+  8192 for BGE reranker) and the configured token budget. The aggregate
+  batch may use the full `max_num_batched_tokens` budget.
+- A simulation run cannot mix generation, embedding, or reranking instances.
+
 ### Runtime overrides (optional)
 
 These fields override the matching `python -m serving` CLI flag for this

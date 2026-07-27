@@ -127,6 +127,7 @@ class BatchCtx:
     lm_head_len: int    # number of sequences
     decode_lens: list   # per-PIM-channel decode lengths (None if no PIM)
     channel_split: int  # PIM channel split factor
+    sequence_lengths: list
 
 
 @dataclass
@@ -158,6 +159,7 @@ class PowerAccumulator:
 #     tp<N>/dense.csv                 layer, tokens, time_us
 #     tp<N>/per_sequence.csv          layer, sequences, time_us
 #     tp<N>/attention.csv             prefill_chunk, kv_prefill, n_decode, kv_decode, time_us
+#     tp<N>/linear_attention.csv      prefill_chunk, n_decode, time_us
 #     tp<N>/moe.csv                   tokens, activated_experts, time_us    (MoE only)
 #
 # Architecture structure (catalog + sequence) lives in the profiler's
@@ -165,7 +167,7 @@ class PowerAccumulator:
 # layers the simulator emits.
 
 
-def _load_architecture(model_type):
+def _load_architecture(model_type, model_architecture=None):
     """Load catalog + sequence from profiler/models/<model_type>.yaml."""
     path = _arch_yaml_path(model_type)
     if not os.path.isfile(path):
@@ -176,9 +178,13 @@ def _load_architecture(model_type):
     with open(path, "r") as f:
         arch = yaml.safe_load(f)
     if "catalog" not in arch or "sequence" not in arch:
-        raise KeyError(
-            f"Architecture yaml {path} must define both 'catalog' and 'sequence'."
-        )
+        sequences = arch.get("sequence_by_architecture") or {}
+        if model_architecture not in sequences:
+            raise KeyError(
+                f"Architecture yaml {path} has no sequence for "
+                f"{model_architecture!r}."
+            )
+        arch["sequence"] = sequences[model_architecture]
     return arch
 
 
@@ -309,6 +315,18 @@ def _build_attention_table(df):
     }
 
 
+def _build_linear_attention_table(df):
+    """2D DeltaNet table keyed by (prefill_chunk, n_decode)."""
+    rows = {}
+    for row in df.itertuples(index=False):
+        rows[(int(row.prefill_chunk), int(row.n_decode))] = int(row.latency_ns)
+    return {
+        "prefill_chunk_vals": sorted({key[0] for key in rows}),
+        "n_decode_vals": sorted({key[1] for key in rows}),
+        "rows": rows,
+    }
+
+
 def _build_moe_table(df):
     """MoE table: (tokens, activated_experts) → latency_ns."""
     tokens_by_experts = {}
@@ -323,7 +341,39 @@ def _build_moe_table(df):
             "rows": [tokens_by_experts[a] for a in ae_vals]}
 
 
-def _load_perf_db(hardware, model, variant, tp_needed, model_type):
+def _build_encoder_table(df):
+    """Encoder table keyed by sequences, max length, and work axis."""
+    out = {}
+    for layer, layer_df in df.groupby("layer"):
+        axis = "quadratic_tokens" if layer == "attention" else "tokens"
+        sequence_rows = {}
+        for sequences, sequence_group in layer_df.groupby("sequences"):
+            max_rows = {}
+            for max_length, group in sequence_group.groupby("max_sequence_length"):
+                group = group.groupby(axis, as_index=False)["latency_ns"].mean()
+                group = group.sort_values(axis)
+                max_rows[int(max_length)] = {
+                    "keys": group[axis].astype(int).tolist(),
+                    "values": group["latency_ns"].astype(int).tolist(),
+                }
+            max_vals = sorted(max_rows)
+            sequence_rows[int(sequences)] = {
+                "max_vals": max_vals,
+                "rows": [max_rows[value] for value in max_vals],
+            }
+        sequence_vals = sorted(sequence_rows)
+        out[str(layer)] = {
+            "sequence_vals": sequence_vals,
+            "rows": [sequence_rows[value] for value in sequence_vals],
+            "axis": axis,
+        }
+    return out
+
+
+def _load_perf_db(
+    hardware, model, variant, tp_needed, model_type,
+    model_architecture=None,
+):
     """Load the per-category perf DB for a (hardware, model, variant)
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
     simulator will query; each must have its own ``tp<N>/`` folder.
@@ -344,7 +394,7 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
 
     meta = _load_meta(root)
     _hydrate_skew_fit_tables(meta, root)
-    arch = _load_architecture(model_type)
+    arch = _load_architecture(model_type, model_architecture)
     tables_per_tp = {}
     available_tps = []
     for entry in sorted(os.listdir(root)):
@@ -368,6 +418,18 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None)
         if attn_df is not None:
             tables["attention"] = _build_attention_table(attn_df)
+
+        linear_attn_df = _read_category_csv(
+            os.path.join(tp_dir, "linear_attention.csv"), None,
+        )
+        if linear_attn_df is not None:
+            tables["linear_attention"] = _build_linear_attention_table(
+                linear_attn_df,
+            )
+
+        encoder_df = _read_category_csv(os.path.join(tp_dir, "encoder.csv"), None)
+        if encoder_df is not None:
+            tables["encoder"] = _build_encoder_table(encoder_df)
 
         moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None)
         if moe_df is not None:
@@ -501,7 +563,9 @@ def _effective_tp(perf_db, category, name, tp):
     either lookup works. Using the current TP keeps things uniform.
     """
     if _tp_stable(perf_db, category, name) and 1 in perf_db["available_tps"]:
-        return 1
+        tp1_tables = perf_db["tables"].get(1, {})
+        if name in tp1_tables.get(category, {}):
+            return 1
     return tp
 
 
@@ -524,6 +588,51 @@ def _lookup_per_sequence(perf_db, name, tp, sequences):
             f"Missing per-sequence profile for layer={name} on tp={tp_eff}."
         )
     return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(sequences), 1))))
+
+
+def _lookup_encoder(
+    perf_db, name, tp, tokens, sequences, quadratic_tokens, max_sequence_length,
+):
+    tp_eff = _effective_tp(perf_db, "encoder", name, tp)
+    table = _tp_tables(perf_db, tp_eff).get("encoder", {}).get(name)
+    if table is None:
+        raise KeyError(f"Missing encoder profile for layer={name} on tp={tp_eff}.")
+    sequence_vals = table["sequence_vals"]
+    rows = table["rows"]
+    query_sequences = max(int(sequences), 1)
+    query_tokens = max(int(
+        quadratic_tokens if table["axis"] == "quadratic_tokens" else tokens
+    ), 1)
+    query_max_length = max(int(max_sequence_length), 1)
+    lo, hi = _lookup_bounds(sequence_vals, query_sequences)
+
+    def _lookup_sequence(row):
+        max_vals = row["max_vals"]
+        max_rows = row["rows"]
+        max_lo, max_hi = _lookup_bounds(max_vals, query_max_length)
+        value_lo = _lookup_1d(
+            max_rows[max_lo]["keys"], max_rows[max_lo]["values"], query_tokens,
+        )
+        if max_lo == max_hi:
+            return value_lo
+        value_hi = _lookup_1d(
+            max_rows[max_hi]["keys"], max_rows[max_hi]["values"], query_tokens,
+        )
+        return _linear_interpolate(
+            max_vals[max_lo], value_lo,
+            max_vals[max_hi], value_hi,
+            query_max_length,
+        )
+
+    value_lo = _lookup_sequence(rows[lo])
+    if lo == hi:
+        return max(1, int(value_lo))
+    value_hi = _lookup_sequence(rows[hi])
+    return max(1, int(_linear_interpolate(
+        sequence_vals[lo], value_lo,
+        sequence_vals[hi], value_hi,
+        query_sequences,
+    )))
 
 
 def _axis_bracket(values, query):
@@ -793,6 +902,34 @@ def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decod
     return max(1, int(out))
 
 
+def _lookup_linear_attention(perf_db, tp, prefill_chunk, n_decode):
+    """Bilinear lookup for DeltaNet's prefill/decode shape table."""
+    tbl = _tp_tables(perf_db, tp).get("linear_attention")
+    if tbl is None or not tbl["rows"]:
+        raise KeyError(f"Missing linear_attention profile for tp={tp}.")
+    pc_vals = tbl["prefill_chunk_vals"]
+    nd_vals = tbl["n_decode_vals"]
+    lo_pc, hi_pc, t_pc = _axis_bracket(pc_vals, max(int(prefill_chunk), 0))
+    lo_nd, hi_nd, t_nd = _axis_bracket(nd_vals, max(int(n_decode), 0))
+
+    def _corner(pc, nd):
+        value = tbl["rows"].get((pc, nd))
+        if value is not None:
+            return value
+        nearest = min(
+            tbl["rows"], key=lambda key: (key[0] - pc) ** 2 + (key[1] - nd) ** 2,
+        )
+        return tbl["rows"][nearest]
+
+    c00 = _corner(pc_vals[lo_pc], nd_vals[lo_nd])
+    c01 = _corner(pc_vals[lo_pc], nd_vals[hi_nd])
+    c10 = _corner(pc_vals[hi_pc], nd_vals[lo_nd])
+    c11 = _corner(pc_vals[hi_pc], nd_vals[hi_nd])
+    v0 = c00 + t_nd * (c01 - c00)
+    v1 = c10 + t_nd * (c11 - c10)
+    return max(1, int(v0 + t_pc * (v1 - v0)))
+
+
 def _lookup_moe(perf_db, tokens, activated_experts):
     """MoE is profiled once at tp=1 (single-rank view); the simulator
     looks up per EP-rank token counts.
@@ -838,7 +975,10 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
             f"profiler/models/<model_type>.yaml"
         )
     tp_needed = {max(int(tp_size), 1)}
-    perf_db = _load_perf_db(hardware, model, variant, tp_needed, model_type)
+    model_architecture = next(iter(config.get("architectures", [])), None)
+    perf_db = _load_perf_db(
+        hardware, model, variant, tp_needed, model_type, model_architecture,
+    )
     warn_if_runtime_exceeds_profiled(
         perf_db, runtime_max_num_batched_tokens, runtime_max_num_seqs)
 
@@ -903,7 +1043,7 @@ def _build_batch_ctx(batch, ctx):
 
     return BatchCtx(batch, total_len, prefill_chunk, kv_prefill, n_decode,
                     kv_decode_mean, kv_decode_max, kv_decode_min,
-                    lm_head_len, decode_lens, channel_split)
+                    lm_head_len, decode_lens, channel_split, list(batch.q_list))
 
 
 # ======================================================================
@@ -911,11 +1051,15 @@ def _build_batch_ctx(batch, ctx):
 # ======================================================================
 
 def _layer_category(perf_db, layer_name):
-    """Return which catalog category (dense/per_sequence/attention/moe)
+    """Return which catalog category (dense/per_sequence/attention/
+    linear_attention/encoder/moe)
     a canonical layer belongs to for this architecture, or None if the
     catalog doesn't include it.
     """
-    for cat in ("per_sequence", "attention", "moe", "dense"):
+    for cat in (
+        "per_sequence", "attention", "linear_attention", "encoder", "moe",
+        "dense",
+    ):
         if _catalog_has(perf_db, cat, layer_name):
             return cat
     return None
@@ -934,6 +1078,13 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
 
     if category == "per_sequence":
         latency_ns = _lookup_per_sequence(ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len)
+    elif category == "encoder":
+        latency_ns = _lookup_encoder(
+            ctx.perf_db, layer_name, ctx.tp_size,
+            bctx.total_len, bctx.lm_head_len,
+            sum(length * length for length in bctx.sequence_lengths),
+            max(bctx.sequence_lengths, default=1),
+        )
     elif category == "attention":
         latency_ns = _lookup_attention_with_skew(
             ctx.perf_db, ctx.tp_size,
@@ -941,18 +1092,25 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
             bctx.kv_decode_min,
         )
+    elif category == "linear_attention":
+        latency_ns = _lookup_linear_attention(
+            ctx.perf_db, ctx.tp_size, bctx.prefill_chunk, bctx.n_decode,
+        )
     else:  # dense
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
     # Size calculation uses the same canonical layer names.
-    if layer_name == 'attention':
+    if layer_name in ('attention', 'full_attention'):
         kv_len_for_sizes = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
                                        kv_len=kv_len_for_sizes,
                                        parallel=ctx.tp_size, fp=ctx.fp)
     else:
-        inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
-                                       parallel=ctx.tp_size, fp=ctx.fp)
+        inp, wt, out = calculate_sizes(
+            ctx.model, layer_name, bctx.total_len,
+            parallel=ctx.tp_size, fp=ctx.fp,
+            sequences=bctx.lm_head_len,
+        )
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
@@ -1041,8 +1199,9 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # ASTRA-Sim AG ``data_size`` is per-rank local chunk (sum / ep_total);
     # RS ``data_size`` is the pre-scatter total buffer.
     n_embd = ctx.config['hidden_size']
-    num_experts = ctx.config.get('num_local_experts', ctx.config.get('num_experts', 0))
-    dispatch_per_token = (n_embd + num_experts) * ctx.fp
+    num_experts = get_num_routed_experts(ctx.config)
+    router_bytes = 4 if ctx.config.get("model_type") == "glm4_moe" else ctx.fp
+    dispatch_per_token = n_embd * ctx.fp + num_experts * router_bytes
     combine_per_token = n_embd * ctx.fp
     ag_per_rank_tokens = max(1, effective_total_len_comm // max(ep_total, 1))
     dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
@@ -1084,7 +1243,8 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         if local_tokens > 0:
             rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1))
             rank_inp, rank_wt, rank_out = calculate_sizes(
-                ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp)
+                ctx.model, "moe", local_tokens, parallel=ep_total,
+                tp_parallel=ctx.tp_size, fp=ctx.fp)
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
             lines.append(formatter("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
@@ -1102,6 +1262,23 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # Post-expert ReduceScatter power (combine)
     if power_acc is not None and ep_total > 1:
         power_acc.link_data_bytes += total_ring_data(combine_comm_size, ep_total, collective="reducescatter")
+
+    if (
+        ctx.tp_size > 1
+        and ctx.config.get("model_type") in ("glm4_moe", "qwen3_next")
+    ):
+        moe_out = bctx.total_len * n_embd * ctx.fp
+        allreduce_type = _with_dim("ALLREDUCE", ctx.tp_dim)
+        # The converter attaches collectives to normal compute nodes, so use a
+        # one-nanosecond dependency node after the expert region.
+        lines.append(formatter(
+            "moe_tp_allreduce", "1", "LOCAL", str(moe_out), "LOCAL", "0",
+            "LOCAL", str(moe_out), allreduce_type, str(moe_out), batch_tag,
+        ))
+        if power_acc is not None:
+            power_acc.link_data_bytes += total_ring_data(
+                moe_out, ctx.tp_size, collective="allreduce",
+            )
 
 
 # ======================================================================
@@ -1136,6 +1313,10 @@ def _layer_available(perf_db, tp, layer_name):
         return layer_name in tables.get("per_sequence", {})
     if category == "attention":
         return bool(tables.get("attention"))
+    if category == "linear_attention":
+        return bool(tables.get("linear_attention"))
+    if category == "encoder":
+        return layer_name in tables.get("encoder", {})
     if category == "moe":
         return bool(tables.get("moe"))
     return False
@@ -1152,9 +1333,27 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
     """
     for layer_name in layers:
         if layer_name == "attention":
+            if _layer_category(ctx.perf_db, layer_name) == "encoder":
+                _emit_layer(
+                    ctx, bctx, layer_name, lines, power_acc,
+                    batch_tag, layer_num,
+                )
+                continue
             if ctx.enable_attn_offloading:
                 _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
             _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
+            continue
+        if layer_name in ("full_attention", "delta_net"):
+            if ctx.enable_attn_offloading:
+                raise RuntimeError(
+                    "qwen3_next attention offloading is not supported because "
+                    "the profiled attention entries include projections"
+                )
+            comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
+            _emit_layer(
+                ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
+                comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size,
+            )
             continue
         if layer_name == "rotary_emb" and "TPU" in ctx.hardware:
             continue
@@ -1180,6 +1379,15 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
 def _emit_pre_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_tag='NONE'):
     _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "pre_attn"),
                    lines, power_acc, batch_tag)
+    typed_layers = (ctx.perf_db["architecture"].get("sequence") or {}).get(
+        "attention_by_type", {},
+    )
+    if typed_layers:
+        layer_type = qwen3_next_layer_type(ctx.config, layer_num)
+        _emit_sequence(
+            ctx, bctx, layer_num, typed_layers.get(layer_type, []),
+            lines, power_acc, batch_tag,
+        )
 
 
 def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str, batch_tag='NONE'):
@@ -1187,7 +1395,11 @@ def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str,
     _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "post_attn"),
                    lines, power_acc, batch_tag)
     # MLP: either the dense FFN stack or a single MoE block.
-    if ctx.is_moe:
+    is_moe_block = (
+        ctx.is_moe
+        and layer_num >= int(ctx.config.get("first_k_dense_replace", 0))
+    )
+    if is_moe_block:
         moe_seq = _sequence(ctx.perf_db, "mlp_moe")
         for layer_name in moe_seq:
             if layer_name == "moe":
@@ -1208,6 +1420,14 @@ def _build_transformer_block(ctx, bctx, layer_num, batch_tag, batch_id_str):
     return lines, power_acc
 
 
+def _requires_per_layer_blocks(ctx):
+    """Return True when block replay would erase model-specific structure."""
+    return (
+        ctx.config.get("model_type") == "qwen3_next"
+        or 0 < int(ctx.config.get("first_k_dense_replace", 0)) < ctx.config["num_hidden_layers"]
+    )
+
+
 # ======================================================================
 # Final layers and power helpers
 # ======================================================================
@@ -1225,6 +1445,17 @@ def _layer_latency_for_power(ctx, bctx, layer_name):
             bctx.prefill_chunk, bctx.kv_prefill,
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
             bctx.kv_decode_min,
+        )
+    if category == "linear_attention":
+        return _lookup_linear_attention(
+            ctx.perf_db, ctx.tp_size, bctx.prefill_chunk, bctx.n_decode,
+        )
+    if category == "encoder":
+        return _lookup_encoder(
+            ctx.perf_db, layer_name, ctx.tp_size,
+            bctx.total_len, bctx.lm_head_len,
+            sum(length * length for length in bctx.sequence_lengths),
+            max(bctx.sequence_lengths, default=1),
         )
     return _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
@@ -1317,7 +1548,11 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
         # Transformer blocks
         num_layers = config['num_hidden_layers']
-        iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
+        iter_count, copy_count = (
+            (num_layers, 1)
+            if block_mode_on or _requires_per_layer_blocks(ctx)
+            else (1, num_layers)
+        )
 
         for layer_num in range(iter_count):
             block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
@@ -1326,7 +1561,11 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
             # opts into block copy (BALANCED is deterministic; others
             # carry tiny per-layer variance that block_copy swallows
             # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+            can_copy = (
+                (not ctx.is_moe or ctx.gate.block_copy)
+                and not block_mode_on
+                and not _requires_per_layer_blocks(ctx)
+            )
             if can_copy:
                 for _ in range(copy_count):
                     f.writelines(block_lines)
@@ -1395,7 +1634,11 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
         # MIDDLE LAYERS: interleaved post_attn + pre_attn
         middle_layers = num_layers - 1
-        iter_count, copy_count = (middle_layers, 1) if block_mode_on else (1, middle_layers)
+        iter_count, copy_count = (
+            (middle_layers, 1)
+            if block_mode_on or _requires_per_layer_blocks(ctx)
+            else (1, middle_layers)
+        )
 
         for layer_num in range(iter_count):
             block_lines = []
@@ -1413,7 +1656,11 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
             # opts into block copy (BALANCED is deterministic; others
             # carry tiny per-layer variance that block_copy swallows
             # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+            can_copy = (
+                (not ctx.is_moe or ctx.gate.block_copy)
+                and not block_mode_on
+                and not _requires_per_layer_blocks(ctx)
+            )
             if can_copy:
                 for _ in range(copy_count):
                     f.writelines(block_lines)
@@ -1454,8 +1701,24 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 
     model = batch.model
     config = get_config(model)
+    if is_encoder_model(config):
+        if tp_size != 1 or pp_size != 1 or local_ep != 1 or ep_total != 1:
+            raise ValueError("Encoder traces require TP=PP=EP=1")
+        if pd_type is not None:
+            raise ValueError("Encoder traces require pd_type=null")
+        if enable_attn_offloading or enable_sub_batch_interleaving:
+            raise ValueError("Encoder traces do not support attention offloading")
+    if config.get("model_type") == "qwen3_next" and enable_prefix_caching:
+        raise ValueError(
+            "qwen3_next requires --no-enable-prefix-caching until DeltaNet "
+            "state is modeled in the prefix cache"
+        )
+    if config.get("model_type") == "qwen3_next" and enable_attn_offloading:
+        raise ValueError(
+            "qwen3_next does not support attention offloading"
+        )
     fp = fp // 8  # bit -> byte of floating point
-    max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
+    max_len = min(max_num_batched_tokens, effective_max_model_len(config))
     variant = resolve_variant(dtype, kv_cache_dtype, config)
 
     # vllm: add load or eviction in the txt file
@@ -1473,7 +1736,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     # make trace — accept either the Mistral-style ``num_local_experts``
     # key or the HF/Qwen3 ``num_experts`` key so both family's configs
     # resolve to a live GateRouter.
-    num_experts_cfg = config.get("num_local_experts", config.get("num_experts"))
+    num_experts_cfg = get_num_routed_experts(config)
     if num_experts_cfg:
         gate = GateRouter(
             node_id, instance_id, num_experts_cfg,

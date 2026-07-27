@@ -85,6 +85,9 @@ def _match_slice(
     for canonical, spec in slice_.items():
         if spec["vllm"] != node_class:
             continue
+        exclude_within = spec.get("exclude_within")
+        if exclude_within is not None and exclude_within in ancestors:
+            continue
         within = spec.get("within")
         if within is None:
             depth = -1

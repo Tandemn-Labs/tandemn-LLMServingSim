@@ -1,0 +1,60 @@
+# GLM-4.5 MoE family.
+#
+# GLM-4.5-Air has one dense MLP block followed by MoE blocks. The profiler
+# creates exactly those two layer kinds so dense MLP and shared-expert module
+# timings remain distinguishable.
+
+profile_hf_overrides:
+  num_hidden_layers: 2
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: [gate_up_proj, act_fn, down_proj]
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: Glm4MoeDecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: QKVParallelLinear
+    rotary_emb:
+      vllm: RotaryEmbedding
+    o_proj:
+      vllm: RowParallelLinear
+      within: Glm4MoeAttention
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+      within: Glm4MoeMLP
+      exclude_within: Glm4MoE
+    act_fn:
+      vllm: SiluAndMul
+      within: Glm4MoeMLP
+      exclude_within: Glm4MoE
+    down_proj:
+      vllm: RowParallelLinear
+      within: Glm4MoeMLP
+      exclude_within: Glm4MoE
+    final_layernorm:
+      vllm: RMSNorm
+      within: Glm4MoeForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention
+  moe:
+    moe:
+      vllm: Glm4MoE

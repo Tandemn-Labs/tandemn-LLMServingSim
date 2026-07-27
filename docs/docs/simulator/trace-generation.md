@@ -9,8 +9,8 @@ sidebar_position: 4
 **profiled latency database** (CSV files produced by the profiler)
 and the **per-batch execution trace** that ASTRA-Sim consumes.
 
-It's the page where "the model has 32 decoder blocks, each block has
-qkv + attention + o_proj + mlp" turns into "this batch takes
+It's the page where "the model has transformer blocks with qkv + attention +
+MLP" turns into "this batch takes
 1.78 ms".
 
 > Looking for the trace file format spec? See
@@ -23,8 +23,9 @@ qkv + attention + o_proj + mlp" turns into "this batch takes
 flowchart LR
     subgraph PROF["Profile DB (loaded once)"]
         DENSE[dense.csv]
-        PERSEQ[per_sequence.csv]
-        ATTN[attention.csv]
+    PERSEQ[per_sequence.csv]
+    ATTN[attention.csv]
+    ENC[encoder.csv]
         MOE[moe.csv]
         SKEW[skew_fit.csv]
     end
@@ -33,6 +34,7 @@ flowchart LR
     DISPATCH -->|dense| DENSE
     DISPATCH -->|per_sequence| PERSEQ
     DISPATCH -->|attention| ATTN
+    DISPATCH -->|encoder| ENC
     DISPATCH -->|moe| MOE
     ATTN --> SKEWBLEND["Blend t_mean and t_max<br/>with alpha"]
     SKEW --> SKEWBLEND
@@ -40,6 +42,7 @@ flowchart LR
     PERSEQ --> EMIT
     SKEWBLEND --> EMIT
     MOE --> EMIT
+    ENC --> EMIT
     EMIT --> TRACEFILE["trace .txt<br/>(per layer)"]
 ```
 
@@ -50,8 +53,9 @@ The profiler writes per-category CSVs at:
 ```
 profiler/perf/<hardware>/<model>/<variant>/tp<N>/{
   dense.csv,
-  per_sequence.csv,
-  attention.csv,
+   per_sequence.csv,
+   attention.csv,
+   encoder.csv,        # encoder-only models
   moe.csv,           # MoE models only
   skew.csv,          # if heterogeneous-decode sweep is on
   skew_fit.csv       # ditto, the fitted alpha table
@@ -85,7 +89,7 @@ On first load, the simulator also:
 ## Per-category lookup
 
 Each layer in the model's architecture YAML is tagged with a
-**category**: dense, per_sequence, attention, or moe. Each category
+**category**: dense, per_sequence, attention, encoder, or moe. Each category
 has its own lookup function:
 
 | Category | Lookup function | Key | Interpolation |
@@ -93,6 +97,7 @@ has its own lookup function:
 | `dense` | `_lookup_dense` | `total_len` (sum of tokens in batch) | 1D linear |
 | `per_sequence` | `_lookup_per_sequence` | `num_requests` | 1D linear |
 | `attention` | `_lookup_attention` | `(prefill_chunk, kv_prefill, n_decode, kv_decode)` | nearest-neighbour on `(pc, n_dec)`, bilinear on `(kv_pre, kv_dec)` |
+| `encoder` | `_lookup_encoder` | `(tokens, sequences, quadratic_tokens, max_sequence_length)` | linear across profiled axes |
 | `moe` | `_lookup_moe` | `(local_tokens, activated_experts)` (per rank, profiled at TP=1) | 2D linear |
 
 All lookups **extrapolate** outside the profiled grid (via linear

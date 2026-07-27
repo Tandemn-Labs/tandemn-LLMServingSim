@@ -24,13 +24,26 @@ Every line is one independent request:
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `input_toks` | int | ✓ | Number of prompt tokens |
-| `output_toks` | int | ✓ | Number of tokens to generate |
+| `output_toks` | int | generation only | Number of tokens to generate. Omit only for supported XLM-R encoder models |
 | `arrival_time_ns` | int | ✓ | When the request arrives in nanoseconds (relative to start of simulation) |
 | `input_tok_ids` | list&lt;int&gt; | optional | Pre-tokenized prompt IDs (enables prefix-cache hashing, see [below](#why-token-ids-matter)) |
 | `output_tok_ids` | list&lt;int&gt; | optional | Pre-tokenized output IDs (used internally for output-side analysis; usually fine to omit) |
 
 If `input_tok_ids` is provided, `len(input_tok_ids)` must equal
 `input_toks` (same for output).
+
+The supported XLM-R encoder embedding and reranking runs use the same flat format but omit
+`output_toks`:
+
+```json
+{"input_toks": 384, "arrival_time_ns": 4059740}
+```
+
+Each request runs once over the complete input. Agentic sessions, prefix
+caching, chunking, P/D disaggregation, and TP greater than one are not
+supported for encoder models. E5 inputs are limited to 512 tokens; BGE
+reranker inputs are limited to 8192 tokens. Every input must also fit the
+simulation's `max_num_batched_tokens` setting.
 
 ### When to use flat
 

@@ -49,6 +49,7 @@ from profiler.core import logger as log
 from profiler.core.config import (
     ProfileArgs,
     detect_model_type,
+    load_architecture,
     read_model_config,
     resolve_architecture_by_model_type,
 )
@@ -86,7 +87,7 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
         "--tp",
         default="1",
         help="Comma-separated TP degrees to sweep, e.g. '1,2,4'. "
-             "Must include 1. Default: '1'.",
+             "Default: '1'.",
     )
     p.add_argument(
         "--variant",
@@ -300,8 +301,8 @@ def _parse_tp(tp_str: str) -> list[int]:
     tps = [int(x.strip()) for x in tp_str.split(",") if x.strip()]
     if not tps:
         raise ValueError("--tp must contain at least one value")
-    if 1 not in tps:
-        raise ValueError("--tp must include 1")
+    if any(tp < 1 for tp in tps):
+        raise ValueError("--tp values must be positive integers")
     return tps
 
 
@@ -310,6 +311,9 @@ def _build_profile_args(
     hf_id: str,
     architecture: str,
     model_config: dict,
+    profile_hf_overrides: dict | None = None,
+    model_architecture: str | None = None,
+    pooler_config: dict | None = None,
 ) -> ProfileArgs:
     return ProfileArgs(
         architecture=architecture,
@@ -332,8 +336,10 @@ def _build_profile_args(
         skew_kvs_factor=getattr(ns, "skew_kvs_factor", 2.0),
         only_skew=getattr(ns, "only_skew", False),
         force=getattr(ns, "force", False),
-        hf_overrides=None,
+        hf_overrides=profile_hf_overrides,
         model_config=model_config,
+        model_architecture=model_architecture,
+        pooler_config=pooler_config,
     )
 
 
@@ -375,7 +381,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_slice.add_argument(
         "--group",
-        choices=["dense", "per_sequence", "attention", "moe"],
+        choices=[
+            "dense", "per_sequence", "attention", "linear_attention",
+            "encoder", "moe",
+        ],
         required=True,
         help="Which profile category to refresh.",
     )
@@ -400,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # 3. Resolve the matching architecture yaml.
     arch_path = resolve_architecture_by_model_type(model_type, ARCH_DIR)
+    model_architecture = next(iter(model_config.get("architectures", [])), None)
+    architecture = load_architecture(arch_path, model_architecture)
 
     log.info(
         "Model config: %s (model_type=%s → architecture=%s)",
@@ -412,7 +423,19 @@ def main(argv: list[str] | None = None) -> int:
         ns, hf_id,
         architecture=arch_path.stem,
         model_config=model_config,
+        profile_hf_overrides=architecture.profile_hf_overrides,
+        model_architecture=model_architecture,
+        pooler_config=architecture.pooler_config_for(model_architecture),
     )
+    if architecture.is_encoder():
+        if profile_args.tp_degrees != [1]:
+            raise ValueError("encoder-only profiling requires --tp 1")
+        if profile_args.dtype != "float16":
+            raise ValueError("encoder-only profiling requires --dtype float16")
+        if profile_args.kv_cache_dtype not in (None, "auto"):
+            raise ValueError("encoder-only profiling does not support --kv-cache-dtype")
+        if profile_args.only_skew:
+            raise ValueError("--only-skew is not applicable to encoder models")
 
     # 5. Dispatch.
     if ns.cmd == "profile":

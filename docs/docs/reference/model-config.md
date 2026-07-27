@@ -6,8 +6,8 @@ title: Model config
 # Model config schema
 
 Model config files live at `configs/model/<org>/<name>.json` and are
-**raw HuggingFace `config.json` files**: exactly what
-`AutoModelForCausalLM` would download from the hub. The simulator
+**raw HuggingFace `config.json` files**: exactly what the appropriate
+Transformers auto-model class would download from the hub. The simulator
 and profiler read a small subset of fields; the rest are ignored.
 
 This page documents the subset that matters.
@@ -40,9 +40,9 @@ profiler downloads and caches it on first run. The simulator
 | --- | --- | --- | --- |
 | `model_type` | string | profiler | Picks the architecture YAML at `profiler/models/<model_type>.yaml`. e.g. `llama`, `qwen3`, `qwen3_moe`, `mixtral`, `phimoe` |
 | `hidden_size` | int | both | Model embedding / hidden dim |
-| `num_hidden_layers` | int | both | Number of decoder blocks |
+| `num_hidden_layers` | int | both | Number of transformer blocks |
 | `num_attention_heads` | int | both | Total attention heads (for TP scaling) |
-| `num_key_value_heads` | int | both | Distinct KV heads (for GQA scaling) |
+| `num_key_value_heads` | int | decoder models | Distinct KV heads (for GQA scaling) |
 | `intermediate_size` | int | both | MLP intermediate dim |
 | `vocab_size` | int | both | Embedding / `lm_head` output dim |
 | `head_dim` | int | both | **Important if not `hidden_size / num_attention_heads`** (Qwen3 has explicit `head_dim`) |
@@ -70,14 +70,15 @@ or `num_experts` and treats them equivalently.
 | Field | Type | Description |
 | --- | --- | --- |
 | `torch_dtype` | string | Default weight dtype. Used when `--dtype` isn't passed. e.g. `bfloat16`, `float16`, `float32` |
-| `architectures` | array | First entry's class name is informational; the simulator dispatches via `model_type` |
+| `architectures` | array | Selects model-specific sequences and pooling heads when a family shares one `model_type` |
+| `max_position_embeddings` | int | Maximum sequence length; XLM-R reserves two positions for its offset |
 | `mlp_only_layers` | array | Indices of layers using dense MLP (vs MoE). Hybrid MoE/dense models like Qwen3-MoE-Instruct use this |
 
 ## Fields the simulator ignores
 
 The HF config has many more fields the simulator doesn't use -
 things like `bos_token_id`, `eos_token_id`, `attention_dropout`,
-`max_position_embeddings`, `rope_*`, `rms_norm_eps`,
+`rope_*`, `rms_norm_eps`,
 `initializer_range`, `tie_word_embeddings`. Leave them as the HF
 config has them; ignored fields don't affect simulation.
 

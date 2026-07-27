@@ -324,7 +324,7 @@ def _measure(llm, reqs, slice_, iters: int) -> float:
     timings = [TimingSample(layer=d["layer"],
                             microseconds=float(d["microseconds"]))
                for d in raw[0]]
-    return sum(t.microseconds for t in timings if t.layer == "attention")
+    return sum(t.microseconds for t in timings)
 
 
 def _measure_case(llm, case: SkewCase, slice_, iters: int) -> dict:
@@ -423,7 +423,12 @@ def sample_skew(
     """
     # Serialize attention catalog slice for the RPC.
     slice_ = {
-        name: {"vllm": e.vllm, "within": e.within, "tp_stable": e.tp_stable}
+        name: {
+            "vllm": e.vllm,
+            "within": e.within,
+            "exclude_within": e.exclude_within,
+            "tp_stable": e.tp_stable,
+        }
         for name, e in arch.catalog.attention.items()
     }
     iters = args.measurement_iterations

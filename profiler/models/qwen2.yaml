@@ -1,0 +1,48 @@
+# Qwen2 family -- dense decoder-only LLMs.
+#
+# Qwen2.5-Coder checkpoints use ``Qwen2ForCausalLM``. Unlike Qwen3, Qwen2
+# has no per-head QK normalization, so the sequence omits ``qk_norm``.
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: [gate_up_proj, act_fn, down_proj]
+  mlp_moe:   []
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: Qwen2DecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: QKVParallelLinear
+    rotary_emb:
+      vllm: RotaryEmbedding
+    o_proj:
+      vllm: RowParallelLinear
+      within: Qwen2Attention
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+    act_fn:
+      vllm: SiluAndMul
+    down_proj:
+      vllm: RowParallelLinear
+      within: Qwen2MLP
+    final_layernorm:
+      vllm: RMSNorm
+      within: Qwen2ForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention

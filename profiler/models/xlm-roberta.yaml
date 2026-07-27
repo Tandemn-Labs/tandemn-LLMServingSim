@@ -1,0 +1,64 @@
+# XLM-R encoder-only embedding and cross-encoder reranking models.
+
+profile_hf_overrides:
+  num_hidden_layers: 1
+
+profile_pooler_by_architecture:
+  XLMRobertaModel:
+    task: embed
+    seq_pooling_type: MEAN
+    max_embed_len: 512
+  XLMRobertaForSequenceClassification:
+    task: classify
+    seq_pooling_type: CLS
+    max_embed_len: 8192
+
+sequence_by_architecture:
+  XLMRobertaModel:
+    prologue: [embedding]
+    pre_attn: [qkv_proj, attention, o_proj, attn_layernorm, intermediate, activation, output, output_layernorm]
+    head: [mean_pool, pooler_normalize]
+  XLMRobertaForSequenceClassification:
+    prologue: [embedding]
+    pre_attn: [qkv_proj, attention, o_proj, attn_layernorm, intermediate, activation, output, output_layernorm]
+    head: [cls_pool, classifier_head]
+
+catalog:
+  dense:
+    embedding:
+      vllm: RobertaEmbedding
+    qkv_proj:
+      vllm: QKVParallelLinear
+      within: BertSelfAttention
+    o_proj:
+      vllm: RowParallelLinear
+      within: BertSelfOutput
+    attn_layernorm:
+      vllm: LayerNorm
+      within: BertSelfOutput
+      tp_stable: true
+    intermediate:
+      vllm: ColumnParallelLinear
+      within: BertIntermediate
+    activation:
+      vllm: GELU
+      within: BertIntermediate
+      tp_stable: true
+    output:
+      vllm: RowParallelLinear
+      within: BertOutput
+    output_layernorm:
+      vllm: LayerNorm
+      within: BertOutput
+      tp_stable: true
+  encoder:
+    attention:
+      vllm: EncoderOnlyAttention
+    mean_pool:
+      vllm: MeanPool
+    pooler_normalize:
+      vllm: PoolerNormalize
+    classifier_head:
+      vllm: ClassifierPoolerHead
+    cls_pool:
+      vllm: CLSPool

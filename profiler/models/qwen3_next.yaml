@@ -1,0 +1,53 @@
+# Qwen3-Next hybrid DeltaNet/full-attention MoE family.
+#
+# Three DeltaNet layers are followed by one full-attention layer. Every base
+# layer is MoE in the checkpoint. The profiling override creates this four
+# layer pattern and makes only the final layer MoE, preserving the profiler's
+# one-FusedMoE forced-routing invariant.
+
+profile_hf_overrides:
+  num_hidden_layers: 4
+  layer_types: [linear_attention, linear_attention, linear_attention, full_attention]
+  decoder_sparse_step: 4
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm]
+  attention_by_type:
+    linear_attention: [delta_net]
+    full_attention: [full_attention]
+  post_attn: [layernorm]
+  mlp_dense: []
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: GemmaRMSNorm
+      within: Qwen3NextDecoderLayer
+      tp_stable: true
+    final_layernorm:
+      vllm: GemmaRMSNorm
+      within: Qwen3NextForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    full_attention:
+      vllm: Qwen3NextAttention
+      within: Qwen3NextDecoderLayer
+  linear_attention:
+    delta_net:
+      vllm: GatedDeltaNetAttention
+      within: Qwen3NextDecoderLayer
+  moe:
+    moe:
+      vllm: Qwen3NextSparseMoeBlock
+      within: Qwen3NextDecoderLayer
