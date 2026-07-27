@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import gc
 import json
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ from profiler.core.config import (
     ProfileArgs,
     probe_moe_params,
 )
+
+
+_QWEN2_PROFILE_HEAD_DIM_ENV = "LLMSERVINGSIM_QWEN2_PROFILE_HEAD_DIM"
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +90,23 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             out[k] = copy.deepcopy(v)
     return out
+
+
+def _canonical_head_dim(model_config: dict[str, Any]) -> int | None:
+    """Return the checkpoint's unsharded attention head width."""
+    explicit = model_config.get("head_dim")
+    if explicit is not None:
+        return int(explicit)
+    hidden_size = model_config.get("hidden_size")
+    num_heads = model_config.get("num_attention_heads")
+    if not isinstance(hidden_size, int) or not isinstance(num_heads, int):
+        return None
+    if hidden_size % num_heads:
+        raise ValueError(
+            f"hidden_size={hidden_size} is not divisible by "
+            f"num_attention_heads={num_heads}"
+        )
+    return hidden_size // num_heads
 
 
 def _profile_engine_overrides(args: ProfileArgs) -> dict[str, Any]:
@@ -212,6 +233,12 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
                 f"divisible by tp={tp}; cannot TP-shard for profiling"
             )
 
+    # Sharding the head count must not change the width of an individual
+    # attention head. Most vLLM model classes honor config.head_dim; Qwen2
+    # needs the worker-side compatibility patch installed by Extension.
+    if (head_dim := _canonical_head_dim(args.model_config)) is not None:
+        sharded_overrides["head_dim"] = head_dim
+
     # 5. Sharding wins.
     kwargs["hf_overrides"] = _deep_merge(hf_overrides, sharded_overrides)
 
@@ -261,8 +288,21 @@ def spin_up(
 
     kwargs["model"] = str(tmpdir)
 
-    with log.capture_stdio():
-        llm = LLM(**kwargs)
+    old_qwen2_head_dim = os.environ.get(_QWEN2_PROFILE_HEAD_DIM_ENV)
+    if args.model_config.get("model_type") == "qwen2":
+        head_dim = _canonical_head_dim(args.model_config)
+        assert head_dim is not None
+        os.environ[_QWEN2_PROFILE_HEAD_DIM_ENV] = str(head_dim)
+    else:
+        os.environ.pop(_QWEN2_PROFILE_HEAD_DIM_ENV, None)
+    try:
+        with log.capture_stdio():
+            llm = LLM(**kwargs)
+    finally:
+        if old_qwen2_head_dim is None:
+            os.environ.pop(_QWEN2_PROFILE_HEAD_DIM_ENV, None)
+        else:
+            os.environ[_QWEN2_PROFILE_HEAD_DIM_ENV] = old_qwen2_head_dim
     return llm, kwargs, tmpdir
 
 
