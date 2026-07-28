@@ -36,7 +36,7 @@ catalog:
       within: LlamaMLP
     final_layernorm:
       vllm: RMSNorm
-      within: LlamaForCausalLM
+      within: Phi3ForCausalLM
       tp_stable: true
   per_sequence:
     lm_head:
