@@ -285,6 +285,11 @@ entry. The wrapper includes MLA projections and attention, so it cannot
 use PIM attention offload. Their FP8 checkpoint profiles resolve to a
 `bf16-fp8` variant when activations use BF16.
 
+Their profile fixtures retain one EP8 rank's routed experts (32 for
+DeepSeek-V3, 48 for Kimi K2) rather than all model experts. Profile with
+`--tp 1,8`: TP1 writes the per-EP-rank `moe.csv`; TP8 writes dense and
+MLA-attention rank timings.
+
 ### Dual MLP decoders
 
 Some models (e.g., experimental architectures) have two MLPs per

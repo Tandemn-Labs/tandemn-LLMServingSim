@@ -1,8 +1,11 @@
 # DeepSeek-V3 uses Multi-Latent Attention (MLA) and routed MoE blocks.
 # Profile three dense blocks plus one MoE block so forced routing sees exactly
 # one FusedMoE instance while preserving the model's dense-to-MoE transition.
+# The synthetic fixture holds one EP8 rank's 32 routed experts; simulator MoE
+# lookup is already per EP rank and retains the full 256-expert model config.
 profile_hf_overrides:
   num_hidden_layers: 4
+  n_routed_experts: 32
 
 sequence:
   prologue:  [embedding]

@@ -1,8 +1,10 @@
 # Kimi K2 uses the DeepSeek-V3 decoder implementation with MLA and MoE.
 # Its first block is dense, so two layers retain one dense MLP and one MoE
-# block for forced-routing profiling.
+# block for forced-routing profiling. The fixture holds one EP8 rank's 48
+# routed experts; the simulator retains the full 384-expert model config.
 profile_hf_overrides:
   num_hidden_layers: 2
+  n_routed_experts: 48
 
 sequence:
   prologue:  [embedding]
