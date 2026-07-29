@@ -58,7 +58,7 @@ to `hidden_size // num_attention_heads`. This is wrong for Qwen3
 | Field | Type | Description |
 | --- | --- | --- |
 | `num_local_experts` | int | Total experts (Mistral-style: e.g., `num_local_experts: 8` for Mixtral 8x7B) |
-| `num_experts` | int | Alternative naming (HF / Qwen-style: e.g., `num_experts: 128` for Qwen3-30B-A3B) |
+| `num_experts` / `n_routed_experts` | int | Alternative expert counts used by Qwen and DeepSeek-style models |
 | `num_experts_per_tok` | int | top-K activations per token. Typical values: 2 (Mixtral), 8 (Qwen3 MoE) |
 | `moe_intermediate_size` | int | Per-expert MLP intermediate dim. Often smaller than the dense `intermediate_size` |
 
@@ -73,6 +73,9 @@ or `num_experts` and treats them equivalently.
 | `architectures` | array | Selects model-specific sequences and pooling heads when a family shares one `model_type` |
 | `max_position_embeddings` | int | Maximum sequence length; XLM-R reserves two positions for its offset |
 | `mlp_only_layers` | array | Indices of layers using dense MLP (vs MoE). Hybrid MoE/dense models like Qwen3-MoE-Instruct use this |
+| `first_k_dense_replace` | int | Initial dense blocks before routed MoE blocks, used by DeepSeek-V3 and Kimi K2 |
+| `kv_lora_rank`, `qk_rope_head_dim` | int | MLA compressed-KV dimensions, used by DeepSeek-V3 and Kimi K2 |
+| `quantization_config` | object | Serialized FP8 weight format. It produces a `bf16-fp8` profile variant when `torch_dtype` is BF16 |
 
 ## Fields the simulator ignores
 

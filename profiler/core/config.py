@@ -507,7 +507,17 @@ class ProfileArgs:
         weight_dtype = self.dtype
         if weight_dtype is None and self.model_config:
             weight_dtype = self.model_config.get("torch_dtype")
-        parts = [_short_dtype(weight_dtype) if weight_dtype else "default"]
+        weight_label = _short_dtype(weight_dtype) if weight_dtype else "default"
+        parts = [weight_label]
+
+        quantization = self.model_config.get("quantization_config") if self.model_config else None
+        quant_method = (
+            str(quantization.get("quant_method", "")).lower()
+            if isinstance(quantization, dict)
+            else ""
+        )
+        if quant_method == "fp8" and weight_label != "fp8":
+            parts.append("fp8")
 
         if self.kv_cache_dtype and self.kv_cache_dtype != "auto":
             parts.append(f"kv{_short_dtype(self.kv_cache_dtype)}")

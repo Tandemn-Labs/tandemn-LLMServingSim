@@ -24,12 +24,14 @@ and compare against the bundled architectures:
 | `qwen3_moe` | `qwen3_moe.yaml` | Qwen3 MoE (30B-A3B, 235B-A22B) |
 | `mixtral` | `mixtral.yaml` | `MixtralForCausalLM` (8x7B, 8x22B) |
 | `phimoe` | `phimoe.yaml` | `PhiMoEForCausalLM` (Phi-3.5-MoE) |
+| `deepseek_v3` | `deepseek_v3.yaml` | DeepSeek-V3 MLA MoE |
+| `kimi_k2` | `kimi_k2.yaml` | Kimi K2 MLA MoE |
 
 If your `model_type` is one of these, you don't need to do anything
 - the existing YAML handles it.
 
-If it's a *new* `model_type` (e.g., `gemma2`, `deepseek_v3`,
-`gpt_oss`), you need a new YAML. Read on.
+If it's a *new* `model_type` (e.g., `gemma2`, `gpt_oss`), you need a
+new YAML. Read on.
 
 ## When you also need simulator code changes
 
@@ -277,6 +279,11 @@ seq_len` would suggest.
 Where: extend `memory_model.py::calculate_sizes` with an MLA case
 that uses the latent dim (`kv_lora_rank`) instead of
 `num_kv_heads * head_dim`.
+
+DeepSeek-V3 and Kimi K2 are supported with an `mla_attention` wrapper
+entry. The wrapper includes MLA projections and attention, so it cannot
+use PIM attention offload. Their FP8 checkpoint profiles resolve to a
+`bf16-fp8` variant when activations use BF16.
 
 ### Dual MLP decoders
 

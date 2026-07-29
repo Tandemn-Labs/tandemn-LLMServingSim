@@ -56,7 +56,16 @@ def resolve_variant(dtype, kv_cache_dtype, model_config=None):
     weight = dtype
     if not weight and model_config is not None:
         weight = model_config.get("torch_dtype")
-    parts = [_short_dtype(weight) if weight else "default"]
+    weight_label = _short_dtype(weight) if weight else "default"
+    parts = [weight_label]
+    quantization = model_config.get("quantization_config") if model_config else None
+    quant_method = (
+        str(quantization.get("quant_method", "")).lower()
+        if isinstance(quantization, dict)
+        else ""
+    )
+    if quant_method == "fp8" and weight_label != "fp8":
+        parts.append("fp8")
     if kv_cache_dtype and kv_cache_dtype != "auto":
         parts.append(f"kv{_short_dtype(kv_cache_dtype)}")
     return "-".join(parts)
@@ -111,6 +120,7 @@ class TraceCtx:
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
+    kv_cache_dtype: str
 
 
 @dataclass
@@ -1003,6 +1013,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -1100,11 +1111,12 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
     # Size calculation uses the same canonical layer names.
-    if layer_name in ('attention', 'full_attention'):
+    if layer_name in ('attention', 'full_attention', 'mla_attention'):
         kv_len_for_sizes = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
-                                       kv_len=kv_len_for_sizes,
-                                       parallel=ctx.tp_size, fp=ctx.fp)
+                                        kv_len=kv_len_for_sizes,
+                                        parallel=ctx.tp_size, fp=ctx.fp,
+                                        kv_cache_dtype=ctx.kv_cache_dtype)
     else:
         inp, wt, out = calculate_sizes(
             ctx.model, layer_name, bctx.total_len,
@@ -1200,7 +1212,11 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # RS ``data_size`` is the pre-scatter total buffer.
     n_embd = ctx.config['hidden_size']
     num_experts = get_num_routed_experts(ctx.config)
-    router_bytes = 4 if ctx.config.get("model_type") == "glm4_moe" else ctx.fp
+    router_bytes = (
+        4
+        if ctx.config.get("model_type") in ("deepseek_v3", "kimi_k2", "glm4_moe")
+        else ctx.fp
+    )
     dispatch_per_token = n_embd * ctx.fp + num_experts * router_bytes
     combine_per_token = n_embd * ctx.fp
     ag_per_rank_tokens = max(1, effective_total_len_comm // max(ep_total, 1))
@@ -1265,7 +1281,9 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
 
     if (
         ctx.tp_size > 1
-        and ctx.config.get("model_type") in ("glm4_moe", "qwen3_next")
+        and ctx.config.get("model_type") in (
+            "deepseek_v3", "kimi_k2", "glm4_moe", "qwen3_next",
+        )
     ):
         moe_out = bctx.total_len * n_embd * ctx.fp
         allreduce_type = _with_dim("ALLREDUCE", ctx.tp_dim)
@@ -1343,11 +1361,11 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
                 _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
             _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
             continue
-        if layer_name in ("full_attention", "delta_net"):
+        if layer_name in ("full_attention", "delta_net", "mla_attention"):
             if ctx.enable_attn_offloading:
                 raise RuntimeError(
-                    "qwen3_next attention offloading is not supported because "
-                    "the profiled attention entries include projections"
+                    "attention offloading is not supported for compound "
+                    "attention entries because the profile includes projections"
                 )
             comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
             _emit_layer(

@@ -398,11 +398,16 @@ def main():
 
         def _pool_kv_bytes_per_token(inst_ids):
             """KV bytes per token for a shared pool."""
+            model = instances[inst_ids[0]]["model_name"]
+            model_type = get_config(model).get("model_type")
             kv_shapes = {
                 (
                     instances[i]["model_name"],
                     instance_runtime_configs[i]["fp"],
                     instance_runtime_configs[i]["kv_cache_dtype"],
+                    instances[i].get("tp_size", 1)
+                    if model_type in ("deepseek_v3", "kimi_k2")
+                    else 1,
                 )
                 for i in inst_ids
             }
@@ -411,9 +416,13 @@ def main():
                     "Shared prefix pool requires instances to share model, "
                     f"dtype, and kv_cache_dtype; got {kv_shapes}"
                 )
-            model = instances[inst_ids[0]]['model_name']
             cfg = instance_runtime_configs[inst_ids[0]]
-            return full_cluster_kv_bytes_per_token(model, cfg["fp"], cfg["kv_cache_dtype"])
+            return full_cluster_kv_bytes_per_token(
+                model,
+                cfg["fp"],
+                cfg["kv_cache_dtype"],
+                tp_size=instances[inst_ids[0]].get("tp_size", 1),
+            )
 
         if prefix_storage == 'CPU':
             for i in range(num_prefix_pool):

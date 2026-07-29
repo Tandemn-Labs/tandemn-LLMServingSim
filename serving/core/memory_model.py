@@ -13,6 +13,34 @@ from enum import Enum
 GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
 KB_TO_BYTE = 1024
+_MLA_MODEL_TYPES = frozenset(("deepseek_v3", "kimi_k2"))
+
+
+def _is_fp8_checkpoint(config):
+    quantization = config.get("quantization_config")
+    return (
+        isinstance(quantization, dict)
+        and str(quantization.get("quant_method", "")).lower() == "fp8"
+    )
+
+
+def _linear_weight_size(config, rows, cols, fp):
+    """Return serialized bytes for one linear weight matrix."""
+    rows, cols = int(rows), int(cols)
+    if not _is_fp8_checkpoint(config):
+        return rows * cols * fp
+
+    block = config.get("quantization_config", {}).get("weight_block_size")
+    if isinstance(block, (list, tuple)) and len(block) == 2:
+        block_rows, block_cols = max(int(block[0]), 1), max(int(block[1]), 1)
+        scales = (
+            (rows + block_rows - 1) // block_rows
+            * ((cols + block_cols - 1) // block_cols)
+            * 4
+        )
+    else:
+        scales = 4
+    return rows * cols + scales
 
 
 def _encoder_head_fp(config, model_fp):
@@ -221,10 +249,19 @@ class MemoryModel():
         block_weight = 0
         _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp)
         block_weight += ln_w  # input layernorm
-        _, qkv_w, _ = calculate_sizes(self.model, 'qkv_proj', 1, parallel=tp, fp=fp)
-        block_weight += qkv_w
-        _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp)
-        block_weight += o_w
+        if self.model_type in _MLA_MODEL_TYPES:
+            _, attn_w, _ = calculate_sizes(
+                self.model, "mla_attention", 1, parallel=tp, fp=fp,
+            )
+            block_weight += attn_w
+        else:
+            _, qkv_w, _ = calculate_sizes(
+                self.model, "qkv_proj", 1, parallel=tp, fp=fp,
+            )
+            _, o_w, _ = calculate_sizes(
+                self.model, "o_proj", 1, parallel=tp, fp=fp,
+            )
+            block_weight += qkv_w + o_w
         block_weight += ln_w  # post layernorm (same weight size)
         if is_moe_block is None:
             is_moe_block = self.is_moe
@@ -264,6 +301,19 @@ class MemoryModel():
 
         if self.is_encoder:
             return 0
+        if self.model_type in _MLA_MODEL_TYPES:
+            pp = max(self.pp_size, 1)
+            local_layers = max(
+                (stage + 1) * self.n_layer // pp - stage * self.n_layer // pp
+                for stage in range(pp)
+            )
+            latent_dim = (
+                int(self.config["kv_lora_rank"])
+                + int(self.config["qk_rope_head_dim"])
+            )
+            # MLA stores one compressed KV latent per layer and replicates it
+            # across TP ranks, unlike ordinary MHA/GQA cache sharding.
+            return latent_dim * seq * local_layers * self.kv_fp
         if self.is_qwen3_next:
             full_layers = self._max_pp_stage_layer_count("full_attention")
             local_kv_heads = max(1, self.kv_head // max(self.tp_size, 1))
@@ -813,7 +863,7 @@ class MemoryModel():
         return (self.npu_prefix_cache.return_prefix_info(), self.second_tier_prefix_cache.return_prefix_info())
 
         
-def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
+def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto', tp_size=1):
     """Bytes of KV cache per token aggregated over the full TP cluster.
 
     Mirrors MemoryModel.get_kv(1) * num_npus but computes directly, avoiding
@@ -831,6 +881,13 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     kv_dim = kv_head * head_dim
     n_layer = config['num_hidden_layers']
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
+    if config.get("model_type") in _MLA_MODEL_TYPES:
+        latent_dim = (
+            int(config["kv_lora_rank"])
+            + int(config["qk_rope_head_dim"])
+        )
+        # MLA's compressed cache is replicated across TP ranks.
+        return latent_dim * n_layer * max(int(tp_size), 1) * kv_fp
     # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
     return 2 * kv_dim * n_layer * kv_fp
 
@@ -838,7 +895,7 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
 # calculate the per-rank input, weight, output size of each layer
 def calculate_sizes(
     model, layer_name, length, kv_len=None, pim=False, parallel=1,
-    tp_parallel=None, fp=2, sequences=None,
+    tp_parallel=None, fp=2, sequences=None, kv_cache_dtype='auto',
 ):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
@@ -923,6 +980,39 @@ def calculate_sizes(
             weight_size = 0
             output_size = (n_head // p) * 1 * head_dim * fp
 
+    elif layer_name == "mla_attention":
+        q_lora_rank = int(config.get("q_lora_rank") or 0)
+        kv_lora_rank = int(config["kv_lora_rank"])
+        qk_nope_head_dim = int(config["qk_nope_head_dim"])
+        qk_rope_head_dim = int(config["qk_rope_head_dim"])
+        v_head_dim = int(config["v_head_dim"])
+        local_heads = max(1, n_head // p)
+        qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        kv_fp = 1 if kv_cache_dtype == 'fp8' else fp
+
+        input_size = (
+            length * n_embd * fp
+            + (kv_lora_rank + qk_rope_head_dim)
+            * max(kv_len or 0, 0)
+            * kv_fp
+        )
+        weight_size = (
+            _linear_weight_size(config, n_embd, q_lora_rank, fp)
+            + _linear_weight_size(config, q_lora_rank, local_heads * qk_head_dim, fp)
+            + _linear_weight_size(
+                config, n_embd, kv_lora_rank + qk_rope_head_dim, fp,
+            )
+            + _linear_weight_size(
+                config,
+                kv_lora_rank,
+                local_heads * (qk_nope_head_dim + v_head_dim),
+                fp,
+            )
+            + _linear_weight_size(config, local_heads * v_head_dim, n_embd, fp)
+            + (q_lora_rank + kv_lora_rank) * fp
+        )
+        output_size = length * n_embd * fp
+
     elif layer_name == "full_attention":
         local_q_dim = q_dim // p
         local_kv_heads = max(1, kv_head // p)
@@ -959,7 +1049,7 @@ def calculate_sizes(
     elif layer_name == "qkv_proj":
         input_size = length * n_embd * fp
         qkv_dim = (q_dim + 2 * kv_dim) // p
-        weight_size = n_embd * qkv_dim * fp
+        weight_size = _linear_weight_size(config, n_embd, qkv_dim, fp)
         if config.get("attention_bias", False):
             weight_size += qkv_dim * fp
         elif is_encoder:
@@ -968,7 +1058,7 @@ def calculate_sizes(
 
     elif layer_name == "o_proj":
         input_size = length * (q_dim // p) * fp
-        weight_size = (q_dim // p) * n_embd * fp
+        weight_size = _linear_weight_size(config, q_dim // p, n_embd, fp)
         if is_encoder:
             weight_size += n_embd * fp
         output_size = length * n_embd * fp
@@ -1016,7 +1106,7 @@ def calculate_sizes(
 
     elif layer_name == "gate_up_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * 2 * (ffn_dim // p) * fp
+        weight_size = _linear_weight_size(config, n_embd, 2 * (ffn_dim // p), fp)
         output_size = length * 2 * (ffn_dim // p) * fp
 
     elif layer_name == "act_fn":
@@ -1026,7 +1116,7 @@ def calculate_sizes(
 
     elif layer_name == "down_proj":
         input_size = length * (ffn_dim // p) * fp
-        weight_size = (ffn_dim // p) * n_embd * fp
+        weight_size = _linear_weight_size(config, ffn_dim // p, n_embd, fp)
         output_size = length * n_embd * fp
 
     elif layer_name == "sampler":
@@ -1037,7 +1127,26 @@ def calculate_sizes(
     elif layer_name == "moe":
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * fp
-        if config.get("model_type") == "glm4_moe":
+        routed_weight_size = (
+            _linear_weight_size(config, n_embd, 2 * moe_ffn_dim, fp)
+            + _linear_weight_size(config, moe_ffn_dim, n_embd, fp)
+        )
+        if config.get("model_type") in _MLA_MODEL_TYPES:
+            shared_experts = int(config.get("n_shared_experts", 0) or 0)
+            shared_size = shared_experts * moe_ffn_dim
+            shared_weight_size = 0
+            if shared_size:
+                shared_weight_size = (
+                    _linear_weight_size(config, n_embd, 2 * (shared_size // tp), fp)
+                    + _linear_weight_size(config, shared_size // tp, n_embd, fp)
+                )
+            weight_size = (
+                n_embd * num_local_experts * fp
+                + num_local_experts * 4  # DeepSeek correction bias is FP32.
+                + experts_per_rank * routed_weight_size
+                + shared_weight_size
+            )
+        elif config.get("model_type") == "glm4_moe":
             shared_experts = int(config.get("n_shared_experts", 0) or 0)
             # GLM's router and correction bias are FP32; the routed experts
             # follow EP while shared experts are replicated across EP.
@@ -1057,13 +1166,14 @@ def calculate_sizes(
         else:
             weight_size = (
                 n_embd * num_local_experts * fp  # gate (replicated)
-                + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp
+                + experts_per_rank * routed_weight_size
             )
         output_size = length * n_embd * fp
 
     # ----------------- LM Head -----------------
     elif layer_name == "lm_head":
         input_size = length * n_embd * fp
+        # FP8 checkpoint quantization does not apply to ParallelLMHead.
         weight_size = n_embd * (vocab_size // p) * fp
         output_size = length * (vocab_size // p) * fp
 
