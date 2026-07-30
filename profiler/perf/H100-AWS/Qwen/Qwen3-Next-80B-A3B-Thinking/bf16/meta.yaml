@@ -1,0 +1,48 @@
+profiler_version: 1.0.0
+vllm_version: 0.19.0
+cuda_version: '12.9'
+gpu: NVIDIA H100 80GB HBM3
+hardware: H100-AWS
+profiled_at: '2026-07-30T02:29:23+00:00'
+architecture: qwen3_next
+architecture_sha256: 58e3c71331c0312285ee32eac7dd9d143d0bef9e56a8fc486ecca0439ebaaf62
+model: Qwen/Qwen3-Next-80B-A3B-Thinking
+variant: bf16
+tp_degrees: [4, 8]
+engine_effective:
+  load_format: dummy
+  enforce_eager: true
+  skip_tokenizer_init: true
+  enable_prefix_caching: false
+  generation_config: vllm
+  tensor_parallel_size: 1
+  block_size: 16
+  gpu_memory_utilization: 0.9
+  max_num_batched_tokens: 2048
+  max_num_seqs: 256
+  hf_overrides:
+    num_hidden_layers: 4
+    layer_types: [linear_attention, linear_attention, linear_attention, full_attention]
+    decoder_sparse_step: 4
+    intermediate_size: 640
+    num_attention_heads: 2
+    num_key_value_heads: 1
+    linear_num_key_heads: 2
+    linear_num_value_heads: 4
+    vocab_size: 18992
+    head_dim: 256
+  mamba_cache_mode: align
+  worker_extension_cls: profiler.core.hooks.extension.Extension
+  model: /tmp/profiler_model_82ihrk8m
+measurement_iterations: 2
+attention_grid:
+  max_kv: 16384
+  chunk_factor: 8.0
+  kv_factor: 8.0
+  chunks: 0, 16-2048 x8
+  n_decode: 0, 1-256 x2
+  kv: 0, 16-16384 x8
+skew_profile:
+  enabled: false
+skew_fit:
+  enabled: false
