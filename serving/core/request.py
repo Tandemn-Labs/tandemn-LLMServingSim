@@ -1,6 +1,6 @@
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True, task="generate"):
         self.id = id
         self.model = model
         self.input = input  # Always keep original input length
@@ -8,6 +8,7 @@ class Request:
         self.arrival = arrival
         self.instance_id = instance_id
         self.is_init = is_init
+        self.task = task
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
         self.evict = False
@@ -49,6 +50,9 @@ class Request:
         self.end_time = end_time
         self.latency = self.end_time - self.arrival
         self.input = self.original_input
+        if self.task != "generate":
+            self.tpot = 0
+            return
         if self.output == self.input + 1:
             self.tpot = 0
         else:
@@ -107,4 +111,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

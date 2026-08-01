@@ -23,10 +23,16 @@ class Scheduler:
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
         self.model = model
         self.config = get_config(model)
+        self.task = encoder_task(self.config)
+        self.is_encoder = self.task != "generate"
+        self.max_model_len = effective_max_model_len(self.config)
         self.node_id = node_id
         self.instance_id = instance_id
         self.max_num_seqs = max_num_seqs
-        self.max_num_batched_tokens = min(max_num_batched_tokens, self.config['max_position_embeddings'])
+        self.max_num_batched_tokens = (
+            max_num_batched_tokens if self.is_encoder else
+            min(max_num_batched_tokens, self.max_model_len)
+        )
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.num_npus = num_npus
         self.tp_size = tp_size
@@ -39,6 +45,15 @@ class Scheduler:
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefix_storage = prefix_storage
         self.prioritize_prefill = prioritize_prefill
+        if self.is_encoder:
+            if tp_size != 1 or pp_size != 1 or ep_size != 1 or pd_type is not None:
+                raise ValueError(
+                    "encoder instances require tp_size=pp_size=ep_size=1 and pd_type=null"
+                )
+            if enable_prefix_caching or enable_chunked_prefill:
+                raise ValueError(
+                    "encoder instances do not support prefix caching or chunked prefill"
+                )
         # lists are sorted in arrival time manner
         self.request = []
         self.inflight = []
@@ -53,10 +68,75 @@ class Scheduler:
     
  
     def schedule(self, current, sys, batch_id=-1):
+        if self.is_encoder:
+            return self.schedule_encoder(current, sys, batch_id)
         if self.enable_prefix_caching:
             return self.schedule_with_prefix(current, sys, batch_id)
         else:
             return self.schedule_base(current, sys, batch_id)
+
+    def schedule_encoder(self, current, sys, batch_id=-1):
+        """Pack complete encoder requests into a single one-shot batch."""
+        if sys != self.start_npu:
+            for batch in self.inflight:
+                if batch.batch_id == batch_id and sys not in batch.fired:
+                    batch.fired.append(sys)
+                    return batch
+            return None
+
+        if self.request and self.request[0].arrival > current:
+            return None
+        if self.inflight:
+            return None
+
+        candidates = [req for req in self.request if req.arrival <= current]
+        if self.max_num_seqs != float('inf'):
+            candidates = candidates[:int(self.max_num_seqs)]
+        batch_req = []
+        total_len = 0
+        for req in candidates:
+            if req.original_input <= 0:
+                raise ValueError(f"Encoder request #{req.id} must contain tokens")
+            if req.original_input > self.max_model_len:
+                raise ValueError(
+                    f"Encoder request #{req.id} has {req.original_input} tokens, "
+                    f"exceeding model limit {self.max_model_len}"
+                )
+            if req.original_input > self.max_num_batched_tokens:
+                raise ValueError(
+                    f"Encoder request #{req.id} has {req.original_input} tokens, "
+                    f"exceeding max_num_batched_tokens={self.max_num_batched_tokens}"
+                )
+            prospective = batch_req + [req]
+            if total_len + req.original_input > self.max_num_batched_tokens:
+                break
+            free_memory = self.memory.npu_mem - self.memory.npu_used
+            if self.memory.get_encoder_activation(prospective) > free_memory:
+                if not batch_req:
+                    raise MemoryError(
+                        f"Encoder request #{req.id} exceeds available activation memory"
+                    )
+                break
+            batch_req = prospective
+            total_len += req.original_input
+        if not batch_req:
+            return None
+
+        for req in batch_req:
+            self.request.remove(req)
+            req.set_que_delay(current)
+
+        lengths = [req.original_input for req in batch_req]
+        batch = Batch(
+            self.get_batch_id(), self.model, total_len, 0,
+            lengths, [], len(batch_req), 0, lengths, [], [],
+            current, 0,
+        )
+        batch.requests.extend(batch_req)
+        batch.scheduled_tokens = {req.id: req.original_input for req in batch_req}
+        batch.fired.append(sys)
+        self.inflight.append(batch)
+        return batch
 
     def _get_reload_size(self, batch_req, batch_len):
         load_size = 0
@@ -659,6 +739,8 @@ class Scheduler:
         
     # pop inflight, add to done
     def add_done(self, id, sys, finish):
+        if self.is_encoder:
+            return self._add_done_encoder(id, sys, finish)
         prompt_t = 0
         gen_t = 0
         end_reqs = []
@@ -810,6 +892,30 @@ class Scheduler:
         del batch
 
         return prompt_t, gen_t, end_reqs
+
+    def _add_done_encoder(self, id, sys, finish):
+        batch_id = id - 1
+        batch = next(
+            (candidate for candidate in self.inflight
+             if candidate.batch_id == batch_id),
+            None,
+        )
+        if batch is None or sys in batch.end:
+            return 0, 0, []
+        batch.end.append(sys)
+        if (self.start_npu not in batch.end or
+                self.start_npu + self.num_npus - 1 not in batch.end):
+            return 0, 0, []
+
+        finished = list(batch.requests)
+        prompt_tokens = 0
+        for req in finished:
+            req.num_computed_tokens = req.original_input
+            prompt_tokens += req.original_input
+            req.add_latency(finish)
+            self.done.append(req)
+        self.inflight.remove(batch)
+        return prompt_tokens, 0, finished
     
 
     ##### Helper Functions ######
@@ -820,7 +926,7 @@ class Scheduler:
 
     # add a request
     def add_request(self, req, is_init=True):
-        new_req = Request(*(req), is_init=is_init)
+        new_req = Request(*(req), is_init=is_init, task=self.task)
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
         return
@@ -874,6 +980,16 @@ class Scheduler:
     
     # print total system request metrics (TTFT, TPOT, ITL)
     def print_result(self):
+        if self.is_encoder:
+            values = [req.latency for req in self.done]
+            print_rule("[sim.tagline]Request Latency[/]")
+            if not values:
+                print_markup("No request latency data available")
+                return
+            print_markup(f"Mean latency (ms): {np.mean(values) / 1_000_000:.2f}")
+            print_markup(f"Median latency (ms): {np.median(values) / 1_000_000:.2f}")
+            print_markup(f"P99 latency (ms): {np.percentile(values, 99) / 1_000_000:.2f}")
+            return
         # Extract ttft, tpot, and itl values from the completed requests
         ttft_values = [req.ttft for req in self.done]
         tpot_values = [req.tpot for req in self.done]
@@ -932,7 +1048,7 @@ class Scheduler:
             
             # Write the column headers
             if not is_append:
-                writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
+                writer.writerow(['instance id', 'request id', 'model', 'input', 'output',
                                 'arrival', 'end_time', 'latency', 
                                 'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
             

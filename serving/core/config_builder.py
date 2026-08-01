@@ -4,7 +4,7 @@ import math
 import sys
 import os
 import shutil
-from .utils import get_config
+from .utils import get_config, get_num_routed_experts, is_encoder_model
 from .pim_model import PIMModel
 from .logger import get_logger
 
@@ -64,10 +64,7 @@ def _resolve_parallelism(instance, model_config):
         For dense models: ep_size defaults to 1
         Without dp_group: ep_size <= tp_size
     """
-    # Accept either the Mistral-style ``num_local_experts`` key or the
-    # HF/Qwen3 ``num_experts`` key — HF naming varies per model family
-    # and the profiler's configs track upstream.
-    is_moe = 'num_local_experts' in model_config or 'num_experts' in model_config
+    is_moe = get_num_routed_experts(model_config) > 0
 
     num_npus = instance.get("num_npus")
     tp_size = instance.get("tp_size")
@@ -110,9 +107,7 @@ def _resolve_parallelism(instance, model_config):
     if dp_group is None and ep_size > tp_size:
         raise ValueError(f"ep_size ({ep_size}) > tp_size ({tp_size}) requires dp_group to be set")
     if is_moe:
-        num_experts = model_config.get(
-            "num_local_experts", model_config.get("num_experts", 1)
-        )
+        num_experts = get_num_routed_experts(model_config)
         if num_experts % ep_size != 0:
             raise ValueError(
                 f"ep_size ({ep_size}) must divide the model's expert count "
@@ -410,6 +405,18 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             # Resolve tp_size, pp_size, ep_size from partial config
             model_config = get_config(instance["model_name"])
             _resolve_parallelism(instance, model_config)
+            if is_encoder_model(model_config):
+                if (
+                    instance["tp_size"] != 1
+                    or instance["pp_size"] != 1
+                    or instance["ep_size"] != 1
+                    or instance.get("pd_type") is not None
+                    or instance.get("dp_group") is not None
+                ):
+                    raise ValueError(
+                        "Encoder instances require TP=PP=EP=1, pd_type=null, "
+                        "and no dp_group"
+                    )
 
             instance["node_id"] = node_id
             instance["instance_id"] = inst_id

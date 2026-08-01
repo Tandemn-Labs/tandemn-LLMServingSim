@@ -1,0 +1,54 @@
+# DeepSeek-V3 uses Multi-Latent Attention (MLA) and routed MoE blocks.
+# Profile three dense blocks plus one MoE block so forced routing sees exactly
+# one FusedMoE instance while preserving the model's dense-to-MoE transition.
+# The synthetic fixture holds one EP8 rank's 32 routed experts; simulator MoE
+# lookup is already per EP rank and retains the full 256-expert model config.
+profile_hf_overrides:
+  num_hidden_layers: 4
+  n_routed_experts: 32
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, mla_attention]
+  post_attn: [layernorm]
+  mlp_dense: [gate_up_proj, act_fn, down_proj]
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      exclude_within: DeepseekV2MLAAttention
+      tp_stable: true
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+      within: DeepseekV2MLP
+      exclude_within: DeepseekV2MoE
+    act_fn:
+      vllm: SiluAndMul
+      within: DeepseekV2MLP
+      exclude_within: DeepseekV2MoE
+    down_proj:
+      vllm: RowParallelLinear
+      within: DeepseekV2MLP
+      exclude_within: DeepseekV2MoE
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV3ForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    mla_attention:
+      vllm: DeepseekV2MLAAttention
+  moe:
+    moe:
+      vllm: DeepseekV2MoE

@@ -20,6 +20,8 @@ profiler/perf/<HARDWARE>/<MODEL>/<variant>/
     ├── dense.csv
     ├── per_sequence.csv
     ├── attention.csv
+    ├── linear_attention.csv          # DeltaNet / recurrent-attention models only
+    ├── encoder.csv                   # encoder-only models
     ├── moe.csv                   # MoE models only
     ├── skew.csv                  # skew-enabled runs only
     └── skew_fit.csv              # skew-enabled runs only
@@ -85,6 +87,32 @@ sampler,1,6.7
 | `time_us` | Measured kernel latency |
 
 Simulator: **1D linear interpolation over `sequences`**.
+
+## `encoder.csv` (encoder-only models)
+
+```text
+layer,tokens,sequences,quadratic_tokens,max_sequence_length,time_us
+attention,512,1,262144,512,42.3
+attention,512,4,65536,128,31.8
+mean_pool,512,4,65536,128,7.1
+classifier_head,512,4,65536,128,5.2
+```
+
+| Column | Meaning |
+| --- | --- |
+| `layer` | Bidirectional attention or pooling/classification head |
+| `tokens` | Total tokens across the batch |
+| `sequences` | Number of complete input sequences |
+| `quadratic_tokens` | Sum of squared sequence lengths, used for bidirectional attention |
+| `max_sequence_length` | Longest sequence in the batch, capturing varlen kernel tiling |
+| `time_us` | Measured kernel latency |
+
+The simulator interpolates pooling heads over total tokens, sequence count,
+and maximum sequence length; attention additionally uses quadratic tokens.
+Encoder
+shots always contain complete sequences and allocate no persistent KV cache.
+`multilingual-e5-large` profiles MEAN pooling plus normalization;
+`bge-reranker-v2-m3` profiles its CLS classification head.
 
 ## `attention.csv`
 
@@ -255,6 +283,19 @@ skew_fit:
       bucket_table: "tp1/skew_fit.csv"
     2:
       ...
+```
+
+Encoder profiles replace `attention_grid` with:
+
+```yaml
+encoder_grid:
+  max_tokens: 2048
+  max_sequences: 256
+  max_model_len: 512
+skew_profile:
+  enabled: false
+skew_fit:
+  enabled: false
 ```
 
 The simulator reads:

@@ -32,6 +32,7 @@ from profiler.core.categories import (
     AttentionPoint,
     Category,
     DensePoint,
+    EncoderPoint,
     ExpertPoint,
     Point,
     SequencePoint,
@@ -244,6 +245,11 @@ _KEY_FIELDS_BY_CATEGORY: dict[str, list[str]] = {
     "dense": ["layer", "tokens"],
     "per_sequence": ["layer", "sequences"],
     "attention": ["prefill_chunk", "kv_prefill", "n_decode", "kv_decode"],
+    "linear_attention": ["prefill_chunk", "n_decode"],
+    "encoder": [
+        "layer", "tokens", "sequences", "quadratic_tokens",
+        "max_sequence_length",
+    ],
     "moe": ["tokens", "activated_experts"],
 }
 
@@ -507,13 +513,14 @@ def persist_meta(
     # meta.yaml so the simulator's runtime-vs-profiled bound comparison
     # and any human inspection see the user-intended cap.
     engine_effective = dict(engine_kwargs_used)
-    try:
-        engine_effective["max_num_batched_tokens"] = (
-            int(engine_effective["max_num_batched_tokens"])
-            - int(engine_effective["max_num_seqs"])
-        )
-    except (KeyError, TypeError, ValueError):
-        pass
+    if args.pooler_config is None:
+        try:
+            engine_effective["max_num_batched_tokens"] = (
+                int(engine_effective["max_num_batched_tokens"])
+                - int(engine_effective["max_num_seqs"])
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
 
     # Effective sweep caps for attention: engine_effective holds the
     # logical (un-bumped) MNBT; MSQ comes from the same block or falls
@@ -543,11 +550,20 @@ def persist_meta(
         # Attention-grid shape knobs + compact spec of the values the
         # sweep actually visited. Simulator uses the knobs to recognise
         # which density produced the CSVs; humans get the axes too.
-        "attention_grid": _attention_grid_spec(args, eff_mnbt, eff_msq),
         "measurement_iterations": args.measurement_iterations,
-        "skew_profile": _skew_meta_block(args),
-        "skew_fit": _skew_fit_block(variant_root, args.tp_degrees),
     }
+    if args.pooler_config is not None:
+        meta["encoder_grid"] = {
+            "max_tokens": eff_mnbt,
+            "max_sequences": eff_msq,
+            "max_model_len": engine_effective.get("max_model_len"),
+        }
+        meta["skew_profile"] = {"enabled": False}
+        meta["skew_fit"] = {"enabled": False}
+    else:
+        meta["attention_grid"] = _attention_grid_spec(args, eff_mnbt, eff_msq)
+        meta["skew_profile"] = _skew_meta_block(args)
+        meta["skew_fit"] = _skew_fit_block(variant_root, args.tp_degrees)
     variant_root.mkdir(parents=True, exist_ok=True)
     out = variant_root / "meta.yaml"
     with out.open("w", encoding="utf-8") as f:

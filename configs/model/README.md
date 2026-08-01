@@ -48,6 +48,8 @@ dimensional fields.
 | `Qwen/Qwen3-30B-A3B-Instruct-2507.json` | MoE | 48 | 2048 | 32 | 4 | 128E / top-8 |
 | `mistralai/Mixtral-8x7B-v0.1.json` | MoE | 32 | 4096 | 32 | 8 | 8E / top-2 |
 | `microsoft/Phi-mini-MoE-instruct.json` | MoE | 32 | 4096 | 32 | 8 | 16E / top-2 |
+| `intfloat/multilingual-e5-large.json` | encoder embedding | 24 | 1024 | 16 | — | — |
+| `BAAI/bge-reranker-v2-m3.json` | encoder reranker | 24 | 1024 | 16 | — | — |
 
 ## Adding a new model
 
@@ -107,6 +109,7 @@ The profiler only runs when a matching architecture yaml exists at
 * `qwen3_moe` — Qwen3 MoE family
 * `mixtral` — Mixtral family
 * `phimoe` — Phi MoE family
+* `xlm-roberta` — TP1 encoder embedding and sequence classification
 
 Any other `model_type` (e.g. `gemma2`, `deepseek_v3`) produces a clear
 error at profile time with instructions for adding support.

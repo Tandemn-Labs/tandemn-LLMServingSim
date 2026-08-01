@@ -154,6 +154,8 @@ def _resolve_instance_dtype(instance, cli_dtype, dtype_to_bits):
 def _build_instance_runtime_configs(instances, args, dtype_to_bits):
     runtime_configs = []
     for instance_id, instance in enumerate(instances):
+        model_config = get_config(instance["model_name"])
+        encoder = is_encoder_model(model_config)
         dtype = _resolve_instance_dtype(instance, args.dtype, dtype_to_bits)
         kv_cache_dtype = instance.get("kv_cache_dtype", args.kv_cache_dtype)
         if kv_cache_dtype not in ("auto", "fp8"):
@@ -165,6 +167,17 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
         if enable_sub_batch_interleaving and not enable_attn_offloading:
             raise RuntimeError(
                 f"Instance {instance_id} enables sub-batch interleaving without attention offloading")
+        if encoder and (
+            enable_attn_offloading
+            or enable_sub_batch_interleaving
+            or instance.get("enable_local_offloading", args.enable_local_offloading)
+        ):
+            raise ValueError(
+                "Encoder instances do not support attention/local offloading "
+                "or sub-batch interleaving"
+            )
+        if encoder and kv_cache_dtype != "auto":
+            raise ValueError("Encoder instances do not use a KV cache dtype")
 
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
@@ -176,9 +189,9 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "dtype": dtype,
             "fp": dtype_to_bits[dtype],
             "kv_cache_dtype": kv_cache_dtype,
-            "enable_chunked_prefill": instance.get(
+            "enable_chunked_prefill": False if encoder else instance.get(
                 "enable_chunked_prefill", args.enable_chunked_prefill),
-            "enable_prefix_caching": instance.get(
+            "enable_prefix_caching": False if encoder else instance.get(
                 "enable_prefix_caching", args.enable_prefix_caching),
             "prioritize_prefill": instance.get("prioritize_prefill", args.prioritize_prefill),
             "enable_local_offloading": instance.get(
@@ -186,6 +199,7 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_attn_offloading": enable_attn_offloading,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
+            "task": encoder_task(model_config),
         })
     return runtime_configs
 
@@ -384,11 +398,16 @@ def main():
 
         def _pool_kv_bytes_per_token(inst_ids):
             """KV bytes per token for a shared pool."""
+            model = instances[inst_ids[0]]["model_name"]
+            model_type = get_config(model).get("model_type")
             kv_shapes = {
                 (
                     instances[i]["model_name"],
                     instance_runtime_configs[i]["fp"],
                     instance_runtime_configs[i]["kv_cache_dtype"],
+                    instances[i].get("tp_size", 1)
+                    if model_type in ("deepseek_v3", "kimi_k2")
+                    else 1,
                 )
                 for i in inst_ids
             }
@@ -397,9 +416,13 @@ def main():
                     "Shared prefix pool requires instances to share model, "
                     f"dtype, and kv_cache_dtype; got {kv_shapes}"
                 )
-            model = instances[inst_ids[0]]['model_name']
             cfg = instance_runtime_configs[inst_ids[0]]
-            return full_cluster_kv_bytes_per_token(model, cfg["fp"], cfg["kv_cache_dtype"])
+            return full_cluster_kv_bytes_per_token(
+                model,
+                cfg["fp"],
+                cfg["kv_cache_dtype"],
+                tp_size=instances[inst_ids[0]].get("tp_size", 1),
+            )
 
         if prefix_storage == 'CPU':
             for i in range(num_prefix_pool):
@@ -479,7 +502,8 @@ def main():
         # Manually adding request (legacy: route all upfront)
         for i in range(16):
             for sched in schedulers:
-                sched.add_request([i, sched.model, 64, 128, 0, i % num_instances])
+                output = 64 if sched.is_encoder else 128
+                sched.add_request([i, sched.model, 64, output, 0, i % num_instances])
 
     # Simulator start
     current = 0 # current tick of the system

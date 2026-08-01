@@ -153,17 +153,19 @@ def run_full(
     out_root: Path,
 ) -> None:
     """Profile every (tp, category) pair for this architecture × model."""
-    arch = load_architecture(arch_path)
+    arch = load_architecture(arch_path, args.model_architecture)
     variant_root = _variant_root(out_root, args)
 
     log.banner(args, variant_root)
 
     last_engine_kwargs: dict[str, Any] | None = None
+    has_tp1 = 1 in args.tp_degrees
 
     for tp in args.tp_degrees:
         # Skip TPs with nothing non-tp_stable to do. The post-pass
-        # replicate_tp_stable will populate their CSVs from tp1.
-        if not arch.has_tp_dependent_work(tp):
+        # replicate_tp_stable will populate their CSVs from tp1. Without
+        # TP1, each requested TP must profile even TP-stable categories.
+        if has_tp1 and not arch.has_tp_dependent_work(tp):
             log.info("TP=%d has only tp_stable work; deferring to replication",
                      tp)
             continue
@@ -193,7 +195,9 @@ def run_full(
 
         try:
             if not args.only_skew:
-                for category in categories_for(arch, tp):
+                for category in categories_for(
+                    arch, tp, replicate_tp_stable=has_tp1,
+                ):
                     _fire_one_category(
                         llm, category, arch, args, limits, tp, tp_root,
                     )
@@ -203,15 +207,15 @@ def run_full(
             # Skew measurement after all categories — uses the same
             # attention kernel slice but fires shots with non-uniform
             # decode kv distributions. Writes tp_root/skew.csv.
-            if not args.skip_skew:
+            if not args.skip_skew and arch.catalog.attention:
                 from profiler.core.skew import sample_skew
                 sample_skew(llm, arch, args, limits, tp, tp_root)
         finally:
             spin_down(llm, tmpdir)
 
-    # After every tp has run, copy tp_stable rows from tp1 into the rest.
-    # Skip when only_skew=True (nothing new to replicate).
-    if not args.only_skew:
+    # After every TP has run, copy TP-stable rows from TP1 into the rest.
+    # Without TP1, requested TPs profiled their own stable rows above.
+    if not args.only_skew and has_tp1:
         with log.stage("replicating tp_stable layers across TP folders"):
             replicate_tp_stable(variant_root, arch, args.tp_degrees)
 
@@ -234,7 +238,7 @@ def run_slice(
     out_root: Path,
 ) -> None:
     """Re-profile one (tp, category) pair without redoing everything."""
-    arch = load_architecture(arch_path)
+    arch = load_architecture(arch_path, args.model_architecture)
     variant_root = _variant_root(out_root, args)
 
     if group not in CATEGORY_BY_NAME:
@@ -273,10 +277,19 @@ def run_slice(
     finally:
         spin_down(llm, tmpdir)
 
-    # A slice refresh at tp=1 may invalidate prior replication; redo it.
+    # A TP1 dense/per-sequence refresh may invalidate prior replication.
+    # A MoE-only TP1 slice has no TP-stable source rows to copy.
     if tp == 1:
-        with log.stage("replicating tp_stable layers"):
-            replicate_tp_stable(variant_root, arch, args.tp_degrees)
+        tp1_root = variant_root / "tp1"
+        if (
+            (tp1_root / "dense.csv").is_file()
+            or (tp1_root / "per_sequence.csv").is_file()
+        ):
+            with log.stage("replicating tp_stable layers"):
+                replicate_tp_stable(variant_root, arch, args.tp_degrees)
+        else:
+            log.info("TP1 slice has no dense/per_sequence rows; "
+                     "skipping tp_stable replication")
 
     persist_meta(args, arch_path, engine_kwargs, variant_root)
 

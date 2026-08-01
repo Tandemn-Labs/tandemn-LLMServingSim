@@ -36,7 +36,7 @@ doesn't.
    there.
 2. Picks the matching architecture YAML by `model_type`.
 3. Writes the model config to a tmpdir; spins vLLM up against that.
-4. Sweeps **dense / per_sequence / attention / moe** shot grids,
+4. Sweeps **dense / per_sequence / attention / encoder / moe** shot grids,
    writing CSVs under `perf/<HW>/<MODEL>/<variant>/tp<N>/`.
 5. (If `SKIP_SKEW=0`, the default) Runs the heterogeneous-decode
    skew sweep and fits per-bucket alphas to `skew_fit.csv`.
@@ -45,6 +45,20 @@ doesn't.
 For each TP degree in `TP_DEGREES`, the simulator emulates that TP
 on a single GPU by dividing the model's per-rank shapes via
 `hf_overrides`. **You only need one GPU** to profile any TP degree.
+
+Encoder-only XLM-R models are the exception: they use vLLM's pooling
+runner and support TP=1 only. Their complete bidirectional sequences cannot
+be chunked or represented as decoder KV-cache shots.
+
+```bash
+python3 -m profiler profile intfloat/multilingual-e5-large \
+  --hardware H100 --tp 1 --dtype float16 \
+  --max-num-batched-tokens 2048 --max-num-seqs 256 --skip-skew
+
+python3 -m profiler profile BAAI/bge-reranker-v2-m3 \
+  --hardware H100 --tp 1 --dtype float16 \
+  --max-num-batched-tokens 2048 --max-num-seqs 256 --skip-skew
+```
 
 ## Required variables
 
@@ -207,6 +221,7 @@ profiler/perf/<HARDWARE>/<MODEL>/<variant>/
     ├── dense.csv
     ├── per_sequence.csv
     ├── attention.csv
+    ├── encoder.csv     (encoder-only models)
     ├── moe.csv         (MoE models only)
     ├── skew.csv         (skew-enabled runs)
     └── skew_fit.csv     (skew-enabled runs)

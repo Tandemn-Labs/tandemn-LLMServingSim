@@ -542,7 +542,7 @@ class LLMConverter:
                             layers[layer_end - 1].name,
                             "OUTPUT",
                             layers[layer_end - 1].output_memory_loc,
-                            layers[layer_end - 1].input_memory_size,
+                            layers[layer_end - 1].output_memory_size,
                         )
                         # if pim_comp_nodes are not consumed yet, add dependency
                         if len(pim_comp_nodes) != 0:

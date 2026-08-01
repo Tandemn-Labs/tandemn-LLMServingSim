@@ -32,7 +32,11 @@ from profiler.core.hooks.moe_hook import (
     force_moe_routing,
     single_moe_layer,
 )
+from profiler.core.hooks.qwen2_patch import install as install_qwen2_profile_patch
 from profiler.core.hooks.timings import extract_samples
+
+
+install_qwen2_profile_patch()
 
 
 class Extension:
@@ -59,7 +63,8 @@ class Extension:
                 scoped to the category we're profiling (so timings for
                 unrelated layers aren't returned).
             kind: One of ``"dense"``, ``"per_sequence"``, ``"attention"``,
-                ``"moe"``. Used to decide whether to forge MoE routing.
+                ``"linear_attention"``, ``"encoder"``, ``"moe"``. Used to
+                decide whether to forge MoE routing.
             iterations: Number of timed forward passes (averaged via
                 the hook's invocation count). Default 3.
 

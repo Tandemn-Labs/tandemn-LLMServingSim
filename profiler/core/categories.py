@@ -8,10 +8,12 @@ Each category knows three things:
   3. Which slice of the ModelSpec's catalog it cares about
      (``catalog_slice``).
 
-Four concrete categories:
+Six concrete categories:
     DenseCategory       token-parameterized layers (embedding, qkv_proj, ...)
     SequenceCategory    sequence-parameterized layers (lm_head, sampler)
     AttentionCategory   the unified prefill+decode+mixed attention grid
+    LinearAttentionCategory  recurrent DeltaNet prefill/decode grid
+    EncoderCategory     bidirectional encoder batches (tokens × sequences)
     ExpertCategory      MoE block (tokens × activated_experts)
 
 Adding a new profile kind is a matter of subclassing ``Category`` and
@@ -60,14 +62,34 @@ class AttentionPoint:
 
 
 @dataclass(frozen=True)
+class LinearAttentionPoint:
+    prefill_chunk: int
+    n_decode: int
+    microseconds: float
+
+
+@dataclass(frozen=True)
 class ExpertPoint:
     tokens: int
     activated_experts: int
     microseconds: float
 
 
+@dataclass(frozen=True)
+class EncoderPoint:
+    layer: str
+    tokens: int
+    sequences: int
+    quadratic_tokens: int
+    max_sequence_length: int
+    microseconds: float
+
+
 # Union alias for writer.py's benefit.
-Point = DensePoint | SequencePoint | AttentionPoint | ExpertPoint
+Point = (
+    DensePoint | SequencePoint | AttentionPoint | LinearAttentionPoint
+    | EncoderPoint | ExpertPoint
+)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +184,12 @@ class Category(ABC):
 def _entry_dict(entries: dict[str, LayerEntry]) -> dict[str, dict]:
     """Serialize a catalog group for RPC transport."""
     return {
-        name: {"vllm": e.vllm, "within": e.within, "tp_stable": e.tp_stable}
+        name: {
+            "vllm": e.vllm,
+            "within": e.within,
+            "exclude_within": e.exclude_within,
+            "tp_stable": e.tp_stable,
+        }
         for name, e in entries.items()
     }
 
@@ -182,13 +209,28 @@ class DenseCategory(Category):
         for n in _token_grid(limits.max_num_batched_tokens):
             # Guard against absurdly small KV caches where even a
             # dense prefill wouldn't fit in a single block budget.
-            if ((n + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE > limits.num_cache_tokens:
+            if (not limits.is_encoder and
+                    ((n + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE
+                    > limits.num_cache_tokens):
                 continue
-            # Context-length bound: a single request of length n must
-            # leave room for the sampler's +1 write.
-            if n >= limits.max_model_len:
-                continue
-            yield Shot.dense(total_tokens=n)
+            if limits.is_encoder:
+                # Encoder dense layers operate on the flattened batch, but an
+                # individual XLM-R request cannot exceed max_model_len.
+                lengths = []
+                remaining = n
+                while remaining > 0:
+                    chunk = min(remaining, limits.max_model_len)
+                    lengths.append(chunk)
+                    remaining -= chunk
+                if len(lengths) > limits.max_num_seqs:
+                    continue
+                yield Shot.encoder_lengths(lengths)
+            else:
+                # A decoder's single prefill request needs one sampler token
+                # of headroom at the maximum context length.
+                if n >= limits.max_model_len:
+                    continue
+                yield Shot.dense(total_tokens=n)
 
     def extract_points(self, shot, timings, arch, tp):
         # Dense shots are one request with all the new tokens packed
@@ -229,7 +271,7 @@ class SequenceCategory(Category):
             # N single-token requests → N new tokens + N blocks used.
             if n > limits.max_num_batched_tokens:
                 continue
-            if n * _BLOCK_SIZE > limits.num_cache_tokens:
+            if not limits.is_encoder and n * _BLOCK_SIZE > limits.num_cache_tokens:
                 continue
             yield Shot.per_sequence(num_sequences=n)
 
@@ -458,6 +500,136 @@ class AttentionCategory(Category):
 
 
 # ---------------------------------------------------------------------------
+# Linear attention (DeltaNet / recurrent state)
+# ---------------------------------------------------------------------------
+
+class LinearAttentionCategory(Category):
+    """Hybrid recurrent-attention timing keyed by prefill and decode count.
+
+    DeltaNet has fixed recurrent state rather than a token-length KV axis, so
+    profiling it on the causal 4D attention grid would create meaningless KV
+    dimensions. The same synthetic request shapes are used, with zero history.
+    """
+
+    name = "linear_attention"
+    sink_filename = "linear_attention.csv"
+    label = "linear_attention"
+
+    def compose_shots(self, arch, args, limits, tp):
+        chunk_vals = _geometric_grid(
+            limits.max_num_batched_tokens, _ATTN_CHUNK_START,
+            factor=args.attention_chunk_factor,
+        )
+        n_dec_vals = _geometric_grid(
+            limits.max_num_seqs, _ATTN_N_DECODE_START,
+        )
+        for chunk in chunk_vals:
+            for n_dec in n_dec_vals:
+                if chunk == 0 and n_dec == 0:
+                    continue
+                if chunk + n_dec > (
+                    limits.max_num_batched_tokens + limits.max_num_seqs
+                ):
+                    continue
+                n_reqs = (1 if chunk > 0 else 0) + n_dec
+                if n_reqs > limits.max_num_seqs:
+                    continue
+                requests = []
+                if chunk > 0:
+                    requests.append((chunk, 0))
+                # A one-token request with zero history is prefill in vLLM.
+                # Any positive history selects DeltaNet's recurrent decode
+                # path; the recurrent state size itself is history-independent.
+                requests.extend([(1, 1)] * n_dec)
+                yield Shot(requests=requests)
+
+    def extract_points(self, shot, timings, arch, tp):
+        reqs = shot.requests
+        if reqs and reqs[0][0] > 1:
+            prefill_chunk = reqs[0][0]
+            n_decode = len(reqs) - 1
+        else:
+            prefill_chunk = 0
+            n_decode = len(reqs)
+        if not timings:
+            return
+        total_us = sum(t.microseconds for t in timings) / len(timings)
+        yield LinearAttentionPoint(
+            prefill_chunk=prefill_chunk,
+            n_decode=n_decode,
+            microseconds=total_us,
+        )
+
+    def catalog_slice(self, arch):
+        return _entry_dict(arch.catalog.linear_attention)
+
+    def shot_key(self, shot):
+        reqs = shot.requests
+        if reqs and reqs[0][0] > 1:
+            return (reqs[0][0], len(reqs) - 1)
+        return (0, len(reqs))
+
+
+# ---------------------------------------------------------------------------
+# Encoder-only attention and pooling heads
+# ---------------------------------------------------------------------------
+
+class EncoderCategory(Category):
+    """Bidirectional encoder work keyed by total tokens and sequences."""
+
+    name = "encoder"
+    sink_filename = "encoder.csv"
+    label = "encoder"
+
+    def compose_shots(self, arch, args, limits, tp):
+        max_length = min(
+            limits.max_model_len,
+            limits.max_num_batched_tokens,
+        )
+        lengths = _power_of_two_grid(max_length)
+        if lengths and lengths[-1] != max_length:
+            lengths.append(max_length)
+        for sequences in _power_of_two_grid(limits.max_num_seqs):
+            for length in lengths:
+                if sequences * length <= limits.max_num_batched_tokens:
+                    yield Shot.encoder(length, sequences)
+                # One long sequence plus short peers covers the high-skew
+                # bidirectional-attention regime at the same batch cardinality.
+                if (
+                    sequences > 1
+                    and length > 1
+                    and length + sequences - 1 <= limits.max_num_batched_tokens
+                ):
+                    yield Shot.encoder_lengths([length] + [1] * (sequences - 1))
+
+    def extract_points(self, shot, timings, arch, tp):
+        tokens = sum(new for new, _ in shot.requests)
+        sequences = len(shot.requests)
+        quadratic_tokens = sum(new * new for new, _ in shot.requests)
+        max_sequence_length = max(new for new, _ in shot.requests)
+        for sample in timings:
+            yield EncoderPoint(
+                layer=sample.layer,
+                tokens=tokens,
+                sequences=sequences,
+                quadratic_tokens=quadratic_tokens,
+                max_sequence_length=max_sequence_length,
+                microseconds=sample.microseconds,
+            )
+
+    def catalog_slice(self, arch):
+        return _entry_dict(arch.catalog.encoder)
+
+    def shot_key(self, shot):
+        return (
+            sum(new for new, _ in shot.requests),
+            len(shot.requests),
+            sum(new * new for new, _ in shot.requests),
+            max(new for new, _ in shot.requests),
+        )
+
+
+# ---------------------------------------------------------------------------
 # MoE
 # ---------------------------------------------------------------------------
 
@@ -490,7 +662,12 @@ class ExpertCategory(Category):
                 continue
             if ((n_tokens + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE > limits.num_cache_tokens:
                 continue
-            for activated in _power_of_two_grid(num_experts):
+            activated_values = sorted({
+                *_power_of_two_grid(num_experts),
+                top_k,
+                num_experts,
+            })
+            for activated in activated_values:
                 # Minimum activations per call is top_k (every token
                 # votes for top_k experts).
                 if activated < top_k:
@@ -530,7 +707,11 @@ class ExpertCategory(Category):
 # Category registry
 # ---------------------------------------------------------------------------
 
-def categories_for(arch: Architecture, tp: int) -> list[Category]:
+def categories_for(
+    arch: Architecture,
+    tp: int,
+    replicate_tp_stable: bool = True,
+) -> list[Category]:
     """Return the list of categories that should run for this (arch, tp).
 
     Excludes:
@@ -539,13 +720,15 @@ def categories_for(arch: Architecture, tp: int) -> list[Category]:
       * ExpertCategory for tp != 1 (MoE is profiled once at tp=1;
         simulator scales per-expert time by ep_size).
       * Any category for which every matching layer is tp_stable AND
-        tp != 1 (replicate_tp_stable will fill it in from tp=1).
+        tp != 1 when TP1 replication is available.
     """
     result: list[Category] = []
     registry = [
         (DenseCategory(), arch.catalog.dense),
         (SequenceCategory(), arch.catalog.per_sequence),
         (AttentionCategory(), arch.catalog.attention),
+        (LinearAttentionCategory(), arch.catalog.linear_attention),
+        (EncoderCategory(), arch.catalog.encoder),
         (ExpertCategory(), arch.catalog.moe),
     ]
     for cat, entries in registry:
@@ -553,7 +736,8 @@ def categories_for(arch: Architecture, tp: int) -> list[Category]:
             continue
         if isinstance(cat, ExpertCategory) and tp != 1:
             continue
-        if tp != 1 and all(e.tp_stable for e in entries.values()):
+        if (replicate_tp_stable and tp != 1
+                and all(e.tp_stable for e in entries.values())):
             continue
         result.append(cat)
     return result
@@ -564,5 +748,7 @@ CATEGORY_BY_NAME: dict[str, type[Category]] = {
     DenseCategory.name: DenseCategory,
     SequenceCategory.name: SequenceCategory,
     AttentionCategory.name: AttentionCategory,
+    LinearAttentionCategory.name: LinearAttentionCategory,
+    EncoderCategory.name: EncoderCategory,
     ExpertCategory.name: ExpertCategory,
 }

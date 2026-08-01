@@ -77,7 +77,7 @@ HARDWARE="RTXPRO6000"               # Free-form label → folder name under perf
 #### Sweep shape
 
 ```bash
-TP_DEGREES="1,2,4"                  # must include 1; profiled one TP at a time on one GPU
+TP_DEGREES="1,2,4"                  # profile only the TP degrees you need; one at a time on one GPU
 MAX_NUM_BATCHED_TOKENS=2048         # vLLM's --max-num-batched-tokens (advisory: the
                                     # profiler internally bumps by +MSQ for shot-bypass
                                     # headroom and subtracts back when recording meta)
@@ -250,6 +250,10 @@ tp<N>/
   dense.csv              layer, tokens, time_us
   per_sequence.csv       layer, sequences, time_us
   attention.csv          prefill_chunk, kv_prefill, n_decode, kv_decode, time_us
+  linear_attention.csv   prefill_chunk, n_decode, time_us       (hybrid models only)
+  encoder.csv            layer, tokens, sequences, quadratic_tokens,
+                         max_sequence_length, time_us
+                                                               (encoder-only models)
   moe.csv                tokens, activated_experts, time_us          (MoE only)
   skew.csv               raw heterogeneous-decode shots (regime, n, nb, ratio,
                          skew, pc, kp, kvs, kv_big, kv_mean, t_mean_us,
@@ -265,6 +269,11 @@ chunked-prefill scheduler actually produces each step). The axes grow
 geometrically — `prefill_chunk` and the kv axes by `ATTENTION_CHUNK_FACTOR`
 and `ATTENTION_KV_FACTOR` respectively (both default 2.0), and
 `n_decode` always on doubling.
+
+XLM-R encoder models use `encoder.csv` instead of causal attention or skew
+tables. They run through vLLM's pooling runner at TP1: MEAN pooling for
+`intfloat/multilingual-e5-large`, and CLS classification for
+`BAAI/bge-reranker-v2-m3`. Pass `--dtype float16` for the FP16 campaign.
 
 `meta.yaml` contains three groups of sweep metadata:
 

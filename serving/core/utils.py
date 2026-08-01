@@ -85,6 +85,51 @@ def get_config(model_name):
     return config
 
 
+def get_num_routed_experts(config):
+    """Return the model's routed expert count, or zero for dense models."""
+    for key in ("num_local_experts", "num_experts", "n_routed_experts"):
+        if key in config and config[key] is not None:
+            return int(config[key])
+    return 0
+
+
+def qwen3_next_layer_type(config, layer_num):
+    """Return the configured Qwen3-Next attention type for a layer."""
+    layer_types = config.get("layer_types")
+    if layer_types:
+        return layer_types[int(layer_num)]
+    interval = max(1, int(config.get("full_attention_interval", 4)))
+    return (
+        "full_attention"
+        if (int(layer_num) + 1) % interval == 0
+        else "linear_attention"
+    )
+
+
+def is_encoder_model(config):
+    """Return whether the config selects a supported encoder-only model."""
+    architectures = config.get("architectures") or []
+    return any(
+        arch in ("XLMRobertaModel", "XLMRobertaForSequenceClassification")
+        for arch in architectures
+    )
+
+
+def encoder_task(config):
+    architectures = config.get("architectures") or []
+    if "XLMRobertaForSequenceClassification" in architectures:
+        return "rerank"
+    if "XLMRobertaModel" in architectures:
+        return "embed"
+    return "generate"
+
+
+def effective_max_model_len(config):
+    """Usable token limit, accounting for XLM-R's two position offsets."""
+    limit = int(config["max_position_embeddings"])
+    return limit - 2 if is_encoder_model(config) else limit
+
+
 if __name__ == "__main__":
     model_name = "meta-llama/Llama-3.1-8B"
     config = get_config(model_name)

@@ -1,5 +1,11 @@
 import os, threading
-from .utils import get_config
+from .utils import (
+    encoder_task,
+    get_config,
+    get_num_routed_experts,
+    is_encoder_model,
+    qwen3_next_layer_type,
+)
 from .radix_tree import *
 import logging
 from enum import Enum
@@ -7,6 +13,46 @@ from enum import Enum
 GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
 KB_TO_BYTE = 1024
+_MLA_MODEL_TYPES = frozenset(("deepseek_v3", "kimi_k2"))
+
+
+def _is_fp8_checkpoint(config):
+    quantization = config.get("quantization_config")
+    return (
+        isinstance(quantization, dict)
+        and str(quantization.get("quant_method", "")).lower() == "fp8"
+    )
+
+
+def _linear_weight_size(config, rows, cols, fp):
+    """Return serialized bytes for one linear weight matrix."""
+    rows, cols = int(rows), int(cols)
+    if not _is_fp8_checkpoint(config):
+        return rows * cols * fp
+
+    block = config.get("quantization_config", {}).get("weight_block_size")
+    if isinstance(block, (list, tuple)) and len(block) == 2:
+        block_rows, block_cols = max(int(block[0]), 1), max(int(block[1]), 1)
+        scales = (
+            (rows + block_rows - 1) // block_rows
+            * ((cols + block_cols - 1) // block_cols)
+            * 4
+        )
+    else:
+        scales = 4
+    return rows * cols + scales
+
+
+def _encoder_head_fp(config, model_fp):
+    """Bytes per element for vLLM pooling heads.
+
+    vLLM defaults pooling heads to FP32 even when encoder blocks are FP16.
+    A checkpoint can opt back into the model dtype with ``head_dtype=model``.
+    """
+    head_dtype = str(config.get("head_dtype", "float32")).lower()
+    if head_dtype in ("model", "float16", "half", "fp16", "bfloat16", "bf16"):
+        return model_fp
+    return 4
 
 class Device(Enum):
     NPU = 1
@@ -33,6 +79,7 @@ class MemoryModel():
         self.prefix_storage = prefix_storage
 
         self.config = get_config(model)
+        self.model_type = self.config.get("model_type")
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
         self.n_head = self.config['num_attention_heads']
@@ -41,10 +88,19 @@ class MemoryModel():
         self.q_dim = self.n_head * self.head_dim       # total Q projection output dim
         self.kv_dim = self.kv_head * self.head_dim     # total KV projection output dim
         self.vocab_size = self.config['vocab_size']
-        # Accept either the Mistral-style ``num_local_experts`` or the
-        # HF/Qwen-style ``num_experts`` key — profiler configs track
-        # upstream HF naming which varies per family.
-        self.is_moe = 'num_local_experts' in self.config or 'num_experts' in self.config
+        self.is_moe = get_num_routed_experts(self.config) > 0
+        self.is_encoder = is_encoder_model(self.config)
+        self.is_qwen3_next = self.model_type == "qwen3_next"
+        self.first_k_dense_replace = int(
+            self.config.get("first_k_dense_replace", 0)
+        )
+
+        if self.is_qwen3_next and enable_prefix_caching:
+            raise ValueError(
+                "qwen3_next prefix caching is not supported yet because "
+                "DeltaNet state is not prefix-addressable; use "
+                "--no-enable-prefix-caching"
+            )
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
@@ -109,9 +165,42 @@ class MemoryModel():
         fp = self.fp
         weight = 0
 
+        if self.is_encoder:
+            _, embedding, _ = calculate_sizes(
+                self.model, "embedding", 1, parallel=tp, fp=fp,
+            )
+            weight = embedding + self._get_encoder_block_weight(tp, fp) * self.n_layer
+            head = (
+                "classifier_head"
+                if encoder_task(self.config) == "rerank"
+                else "mean_pool"
+            )
+            _, head_weight, _ = calculate_sizes(
+                self.model, head, 1, parallel=tp, fp=fp, sequences=1,
+            )
+            weight += head_weight
+            self.logger.info("NPU: model weight %dMB loaded", weight // MB_TO_BYTE)
+            return weight
+
         _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp)
         weight += embedding
-        weight += self._get_weight_per_block(tp, ep, fp) * (self.n_layer // pp)
+        if self.is_qwen3_next:
+            block_weights = [
+                self._get_qwen3_next_block_weight(tp, ep, fp, layer_num)
+                for layer_num in range(self.n_layer)
+            ]
+            weight += self._max_pp_stage_weight(block_weights, pp)
+        elif self.first_k_dense_replace > 0:
+            block_weights = [
+                self._get_weight_per_block(
+                    tp, ep, fp,
+                    is_moe_block=layer_num >= self.first_k_dense_replace,
+                )
+                for layer_num in range(self.n_layer)
+            ]
+            weight += self._max_pp_stage_weight(block_weights, pp)
+        else:
+            weight += self._get_weight_per_block(tp, ep, fp) * (self.n_layer // pp)
         _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp)
         weight += ln_f
         _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp)
@@ -123,18 +212,63 @@ class MemoryModel():
         )
         return weight
 
-    def _get_weight_per_block(self, tp, ep, fp):
+    def _get_encoder_block_weight(self, tp, fp):
+        return sum(
+            calculate_sizes(self.model, layer, 1, parallel=tp, fp=fp)[1]
+            for layer in (
+                "qkv_proj", "o_proj", "attn_layernorm", "intermediate",
+                "output", "output_layernorm",
+            )
+        )
+
+    @staticmethod
+    def _max_pp_stage_weight(block_weights, pp):
+        if pp <= 1:
+            return sum(block_weights)
+        return max(
+            sum(block_weights[stage * len(block_weights) // pp:
+                              (stage + 1) * len(block_weights) // pp])
+            for stage in range(pp)
+        )
+
+    def _max_pp_stage_layer_count(self, layer_type):
+        pp = max(self.pp_size, 1)
+        return max(
+            sum(
+                qwen3_next_layer_type(self.config, layer_num) == layer_type
+                for layer_num in range(
+                    stage * self.n_layer // pp,
+                    (stage + 1) * self.n_layer // pp,
+                )
+            )
+            for stage in range(pp)
+        )
+
+    def _get_weight_per_block(self, tp, ep, fp, is_moe_block=None):
         """Per-block weight: dense layers use TP, MoE experts use EP."""
         block_weight = 0
         _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp)
         block_weight += ln_w  # input layernorm
-        _, qkv_w, _ = calculate_sizes(self.model, 'qkv_proj', 1, parallel=tp, fp=fp)
-        block_weight += qkv_w
-        _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp)
-        block_weight += o_w
+        if self.model_type in _MLA_MODEL_TYPES:
+            _, attn_w, _ = calculate_sizes(
+                self.model, "mla_attention", 1, parallel=tp, fp=fp,
+            )
+            block_weight += attn_w
+        else:
+            _, qkv_w, _ = calculate_sizes(
+                self.model, "qkv_proj", 1, parallel=tp, fp=fp,
+            )
+            _, o_w, _ = calculate_sizes(
+                self.model, "o_proj", 1, parallel=tp, fp=fp,
+            )
+            block_weight += qkv_w + o_w
         block_weight += ln_w  # post layernorm (same weight size)
-        if self.is_moe:
-            _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp)
+        if is_moe_block is None:
+            is_moe_block = self.is_moe
+        if is_moe_block:
+            _, moe_w, _ = calculate_sizes(
+                self.model, 'moe', 1, parallel=ep, tp_parallel=tp, fp=fp,
+            )
             block_weight += moe_w
         else:
             _, ffn1_w, _ = calculate_sizes(self.model, 'gate_up_proj', 1, parallel=tp, fp=fp)
@@ -143,20 +277,90 @@ class MemoryModel():
             block_weight += ffn2_w
         return block_weight
 
+    def _get_qwen3_next_block_weight(self, tp, ep, fp, layer_num):
+        attention_layer = (
+            "full_attention"
+            if qwen3_next_layer_type(self.config, layer_num) == "full_attention"
+            else "delta_net"
+        )
+        _, attn_w, _ = calculate_sizes(
+            self.model, attention_layer, 1, parallel=tp, fp=fp,
+        )
+        _, ln_w, _ = calculate_sizes(
+            self.model, "layernorm", 1, parallel=tp, fp=fp,
+        )
+        _, moe_w, _ = calculate_sizes(
+            self.model, "moe", 1, parallel=ep, tp_parallel=tp, fp=fp,
+        )
+        return attn_w + 2 * ln_w + moe_w
+
     def get_kv(self, seq):
         # shape of kv cache
         # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
         # return batch_size = 1 to caclulate max batch_size in scheduler
 
+        if self.is_encoder:
+            return 0
+        if self.model_type in _MLA_MODEL_TYPES:
+            pp = max(self.pp_size, 1)
+            local_layers = max(
+                (stage + 1) * self.n_layer // pp - stage * self.n_layer // pp
+                for stage in range(pp)
+            )
+            latent_dim = (
+                int(self.config["kv_lora_rank"])
+                + int(self.config["qk_rope_head_dim"])
+            )
+            # MLA stores one compressed KV latent per layer and replicates it
+            # across TP ranks, unlike ordinary MHA/GQA cache sharding.
+            return latent_dim * seq * local_layers * self.kv_fp
+        if self.is_qwen3_next:
+            full_layers = self._max_pp_stage_layer_count("full_attention")
+            local_kv_heads = max(1, self.kv_head // max(self.tp_size, 1))
+            return 2 * local_kv_heads * self.head_dim * seq * full_layers * self.kv_fp
+
         # K & V multiply 2
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
+
+    def get_encoder_activation(self, requests):
+        """Conservative peak transient tensor bytes for an encoder batch."""
+        if not self.is_encoder:
+            return 0
+        tokens = sum(req.original_input for req in requests)
+        hidden = tokens * self.n_embd * self.fp
+        qkv = 3 * hidden
+        ffn = tokens * self.config["intermediate_size"] * self.fp
+        return hidden + max(qkv, ffn)
+
+    def _qwen3_next_state_bytes(self):
+        if not self.is_qwen3_next:
+            return 0
+        linear_layers = self._max_pp_stage_layer_count("linear_attention")
+        tp = max(self.tp_size, 1)
+        channels = (
+            2 * self.config["linear_num_key_heads"] * self.config["linear_key_head_dim"]
+            + self.config["linear_num_value_heads"] * self.config["linear_value_head_dim"]
+        )
+        conv_state = (
+            (self.config["linear_conv_kernel_dim"] - 1)
+            * channels // tp
+        )
+        ssm_state = (
+            self.config["linear_num_value_heads"] // tp
+            * self.config["linear_value_head_dim"]
+            * self.config["linear_key_head_dim"]
+        )
+        return linear_layers * (conv_state + ssm_state) * self.fp
     
     # get the total size of current kv cache for the request
     # used when adding prefilled request to decode instance.
     def get_total_kv(self, req):
         # ceil division: (n + block_size - 1) // block_size
         num_blocks = (req.num_computed_tokens + self.block_size - 1) // self.block_size
-        return self.get_kv(num_blocks * self.block_size)
+        total = self.get_kv(num_blocks * self.block_size)
+        if self.is_qwen3_next and req.num_computed_tokens > 0:
+            total += self._qwen3_next_state_bytes()
+        return total
 
     # get size of kv block that should be 'added'. including new init requests
     # also checks evicted request and include its kv cache
@@ -194,6 +398,8 @@ class MemoryModel():
                 
                 new_blocks = max(0, blocks_after - blocks_before)
                 block_kv_size += self.get_kv(new_blocks * self.block_size)
+                if self.is_qwen3_next and computed_before == 0 and new_blocks > 0:
+                    block_kv_size += self._qwen3_next_state_bytes()
                 # print("[DEBUG] hit : {} | tokens_this_step : {} | computed_before : {} | total_after : {} | new_blocks : {} | block_kv_size : {}".format(
                 #     hit, tokens_this_step, computed_before, total_after, new_blocks, block_kv_size
                 # ))
@@ -216,6 +422,8 @@ class MemoryModel():
         # ceil division: (needed + block_size - 1) // block_size
         num_blocks = (needed + self.block_size - 1) // self.block_size
         evict_size += self.get_kv(num_blocks * self.block_size)
+        if self.is_qwen3_next and needed > 0:
+            evict_size += self._qwen3_next_state_bytes()
         return evict_size
 
     def free_weight(self):
@@ -655,7 +863,7 @@ class MemoryModel():
         return (self.npu_prefix_cache.return_prefix_info(), self.second_tier_prefix_cache.return_prefix_info())
 
         
-def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
+def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto', tp_size=1):
     """Bytes of KV cache per token aggregated over the full TP cluster.
 
     Mirrors MemoryModel.get_kv(1) * num_npus but computes directly, avoiding
@@ -664,6 +872,8 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     for the KV cache regardless of weight dtype.
     """
     config = get_config(model)
+    if is_encoder_model(config):
+        return 0
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
     head_dim = config.get('head_dim', n_embd // n_head)
@@ -671,12 +881,22 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     kv_dim = kv_head * head_dim
     n_layer = config['num_hidden_layers']
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
+    if config.get("model_type") in _MLA_MODEL_TYPES:
+        latent_dim = (
+            int(config["kv_lora_rank"])
+            + int(config["qk_rope_head_dim"])
+        )
+        # MLA's compressed cache is replicated across TP ranks.
+        return latent_dim * n_layer * max(int(tp_size), 1) * kv_fp
     # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
     return 2 * kv_dim * n_layer * kv_fp
 
 
 # calculate the per-rank input, weight, output size of each layer
-def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2):
+def calculate_sizes(
+    model, layer_name, length, kv_len=None, pim=False, parallel=1,
+    tp_parallel=None, fp=2, sequences=None, kv_cache_dtype='auto',
+):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
@@ -693,13 +913,13 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     kv_dim = kv_head * head_dim     # total KV projection output dim
     ffn_dim = config.get("intermediate_size", config.get("ffn_dim"))  # dense FFN dim
     moe_ffn_dim = config.get("moe_intermediate_size", ffn_dim)  # per-expert FFN dim (may differ from dense)
-    # Same both-name fallback as MemoryModel.__init__ — HF / Qwen use
-    # ``num_experts`` while Mistral uses ``num_local_experts``.
-    num_local_experts = config.get(
-        "num_local_experts", config.get("num_experts", 1)
-    )
+    num_local_experts = get_num_routed_experts(config)
+    is_encoder = is_encoder_model(config)
+    encoder_head_fp = _encoder_head_fp(config, fp) if is_encoder else fp
+    num_sequences = max(int(sequences if sequences is not None else length), 1)
 
     p = max(int(parallel), 1)
+    tp = max(int(tp_parallel if tp_parallel is not None else p), 1)
 
     # NOTE (vLLM-style assumptions):
     # NOTE (vLLM-style assumptions):
@@ -713,11 +933,20 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     if layer_name == "embedding":
         input_size = length * fp * 2  # token_ids are int32 or int64
         weight_size = (vocab_size // p) * n_embd * fp
+        if is_encoder:
+            weight_size += (
+                config["max_position_embeddings"] * n_embd
+                + config.get("type_vocab_size", 1) * n_embd
+                + 2 * n_embd
+            ) * fp
         output_size = length * n_embd * fp
 
-    elif layer_name in ["input_layernorm", "post_layernorm", "final_layernorm", "layernorm"]:
+    elif layer_name in [
+        "input_layernorm", "post_layernorm", "final_layernorm", "layernorm",
+        "attn_layernorm", "output_layernorm",
+    ]:
         input_size = length * n_embd * fp
-        weight_size = 1 * n_embd * fp  # scale only
+        weight_size = (2 if is_encoder else 1) * n_embd * fp
         output_size = length * n_embd * fp
 
     elif layer_name == "qk_norm":
@@ -732,7 +961,11 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         output_size = ((n_head // p) + (kv_head // p)) * length * head_dim * fp
 
     elif layer_name == "attention":
-        if not pim:
+        if is_encoder:
+            input_size = 3 * length * n_embd * fp // p
+            weight_size = 0
+            output_size = length * n_embd * fp // p
+        elif not pim:
             input_size = (
                 (n_head // p) * length * head_dim * fp +
                 (kv_head // p) * kv_len * head_dim * fp * 2
@@ -747,20 +980,133 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             weight_size = 0
             output_size = (n_head // p) * 1 * head_dim * fp
 
+    elif layer_name == "mla_attention":
+        q_lora_rank = int(config.get("q_lora_rank") or 0)
+        kv_lora_rank = int(config["kv_lora_rank"])
+        qk_nope_head_dim = int(config["qk_nope_head_dim"])
+        qk_rope_head_dim = int(config["qk_rope_head_dim"])
+        v_head_dim = int(config["v_head_dim"])
+        local_heads = max(1, n_head // p)
+        qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        kv_fp = 1 if kv_cache_dtype == 'fp8' else fp
+
+        input_size = (
+            length * n_embd * fp
+            + (kv_lora_rank + qk_rope_head_dim)
+            * max(kv_len or 0, 0)
+            * kv_fp
+        )
+        weight_size = (
+            _linear_weight_size(config, n_embd, q_lora_rank, fp)
+            + _linear_weight_size(config, q_lora_rank, local_heads * qk_head_dim, fp)
+            + _linear_weight_size(
+                config, n_embd, kv_lora_rank + qk_rope_head_dim, fp,
+            )
+            + _linear_weight_size(
+                config,
+                kv_lora_rank,
+                local_heads * (qk_nope_head_dim + v_head_dim),
+                fp,
+            )
+            + _linear_weight_size(config, local_heads * v_head_dim, n_embd, fp)
+            + (q_lora_rank + kv_lora_rank) * fp
+        )
+        output_size = length * n_embd * fp
+
+    elif layer_name == "full_attention":
+        local_q_dim = q_dim // p
+        local_kv_heads = max(1, kv_head // p)
+        local_kv_dim = local_kv_heads * head_dim
+        qkv_output_dim = 2 * local_q_dim + 2 * local_kv_dim
+        input_size = (
+            length * n_embd * fp
+            + local_kv_dim * max(kv_len or 0, 0) * fp * 2
+        )
+        weight_size = (
+            n_embd * qkv_output_dim
+            + local_q_dim * n_embd
+            + 2 * head_dim
+        ) * fp
+        output_size = length * n_embd * fp
+
+    elif layer_name == "delta_net":
+        linear_key_heads = config["linear_num_key_heads"]
+        linear_value_heads = config["linear_num_value_heads"]
+        key_head_dim = config["linear_key_head_dim"]
+        value_head_dim = config["linear_value_head_dim"]
+        channels = 2 * linear_key_heads * key_head_dim + linear_value_heads * value_head_dim
+        weight_size = (
+            n_embd * (2 * linear_key_heads * key_head_dim + 2 * linear_value_heads * value_head_dim) // p
+            + n_embd * (2 * linear_value_heads) // p
+            + config["linear_conv_kernel_dim"] * channels // p
+            + (linear_value_heads * value_head_dim // p) * n_embd
+            + value_head_dim
+        ) * fp
+        input_size = length * n_embd * fp
+        output_size = length * n_embd * fp
+
     # ----------------- QKV Projection (fused) -----------------
     elif layer_name == "qkv_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
+        qkv_dim = (q_dim + 2 * kv_dim) // p
+        weight_size = _linear_weight_size(config, n_embd, qkv_dim, fp)
+        if config.get("attention_bias", False):
+            weight_size += qkv_dim * fp
+        elif is_encoder:
+            weight_size += qkv_dim * fp
         output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
 
     elif layer_name == "o_proj":
         input_size = length * (q_dim // p) * fp
-        weight_size = (q_dim // p) * n_embd * fp
+        weight_size = _linear_weight_size(config, q_dim // p, n_embd, fp)
+        if is_encoder:
+            weight_size += n_embd * fp
         output_size = length * n_embd * fp
+
+    elif layer_name == "intermediate":
+        input_size = length * n_embd * fp
+        weight_size = (n_embd * (ffn_dim // p) + ffn_dim // p) * fp
+        output_size = length * (ffn_dim // p) * fp
+
+    elif layer_name == "activation":
+        input_size = length * (ffn_dim // p) * fp
+        weight_size = 0
+        output_size = input_size
+
+    elif layer_name == "output":
+        input_size = length * (ffn_dim // p) * fp
+        weight_size = ((ffn_dim // p) * n_embd + n_embd) * fp
+        output_size = length * n_embd * fp
+
+    elif layer_name == "mean_pool":
+        input_size = length * n_embd * fp
+        weight_size = 0
+        output_size = num_sequences * n_embd * encoder_head_fp
+
+    elif layer_name == "pooler_normalize":
+        input_size = num_sequences * n_embd * encoder_head_fp
+        weight_size = 0
+        output_size = input_size
+
+    elif layer_name == "classifier_head":
+        # ClassifierPoolerHead converts the CLS vector to vLLM's FP32
+        # pooling-head dtype before running RobertaClassificationHead.
+        input_size = num_sequences * n_embd * fp
+        num_labels = int(config.get("num_labels", len(config.get("id2label", {0: 0}))))
+        weight_size = (
+            n_embd * n_embd + n_embd
+            + n_embd * num_labels + num_labels
+        ) * encoder_head_fp
+        output_size = num_sequences * num_labels * encoder_head_fp
+
+    elif layer_name == "cls_pool":
+        input_size = length * n_embd * fp
+        weight_size = 0
+        output_size = num_sequences * n_embd * fp
 
     elif layer_name == "gate_up_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * 2 * (ffn_dim // p) * fp
+        weight_size = _linear_weight_size(config, n_embd, 2 * (ffn_dim // p), fp)
         output_size = length * 2 * (ffn_dim // p) * fp
 
     elif layer_name == "act_fn":
@@ -770,7 +1116,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     elif layer_name == "down_proj":
         input_size = length * (ffn_dim // p) * fp
-        weight_size = (ffn_dim // p) * n_embd * fp
+        weight_size = _linear_weight_size(config, ffn_dim // p, n_embd, fp)
         output_size = length * n_embd * fp
 
     elif layer_name == "sampler":
@@ -781,13 +1127,53 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     elif layer_name == "moe":
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * fp
-        weight_size = (n_embd * num_local_experts * fp  # gate (replicated)
-                     + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp)  # local experts
+        routed_weight_size = (
+            _linear_weight_size(config, n_embd, 2 * moe_ffn_dim, fp)
+            + _linear_weight_size(config, moe_ffn_dim, n_embd, fp)
+        )
+        if config.get("model_type") in _MLA_MODEL_TYPES:
+            shared_experts = int(config.get("n_shared_experts", 0) or 0)
+            shared_size = shared_experts * moe_ffn_dim
+            shared_weight_size = 0
+            if shared_size:
+                shared_weight_size = (
+                    _linear_weight_size(config, n_embd, 2 * (shared_size // tp), fp)
+                    + _linear_weight_size(config, shared_size // tp, n_embd, fp)
+                )
+            weight_size = (
+                n_embd * num_local_experts * fp
+                + num_local_experts * 4  # DeepSeek correction bias is FP32.
+                + experts_per_rank * routed_weight_size
+                + shared_weight_size
+            )
+        elif config.get("model_type") == "glm4_moe":
+            shared_experts = int(config.get("n_shared_experts", 0) or 0)
+            # GLM's router and correction bias are FP32; the routed experts
+            # follow EP while shared experts are replicated across EP.
+            weight_size = (
+                (n_embd * num_local_experts + num_local_experts) * 4
+                + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp
+                + shared_experts * 3 * n_embd * moe_ffn_dim * fp // tp
+            )
+        elif config.get("model_type") == "qwen3_next":
+            shared_size = int(config.get("shared_expert_intermediate_size", 0) or 0)
+            weight_size = (
+                n_embd * num_local_experts * fp
+                + n_embd * fp  # shared expert gate
+                + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp
+                + 3 * n_embd * shared_size * fp // tp
+            )
+        else:
+            weight_size = (
+                n_embd * num_local_experts * fp  # gate (replicated)
+                + experts_per_rank * routed_weight_size
+            )
         output_size = length * n_embd * fp
 
     # ----------------- LM Head -----------------
     elif layer_name == "lm_head":
         input_size = length * n_embd * fp
+        # FP8 checkpoint quantization does not apply to ParallelLMHead.
         weight_size = n_embd * (vocab_size // p) * fp
         output_size = length * (vocab_size // p) * fp
 

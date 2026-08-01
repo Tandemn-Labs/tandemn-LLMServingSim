@@ -1,0 +1,44 @@
+profiler_version: 1.0.0
+vllm_version: 0.19.0
+cuda_version: '12.9'
+gpu: NVIDIA H100 80GB HBM3
+hardware: H100
+profiled_at: '2026-07-29T20:07:20+00:00'
+architecture: xlm-roberta
+architecture_sha256: 792d3991489a56bde932bac70c956b95043530160a08b5de5e43e1af7d8edbd4
+model: intfloat/multilingual-e5-large
+variant: fp16
+tp_degrees: [1]
+engine_effective:
+  load_format: dummy
+  enforce_eager: true
+  skip_tokenizer_init: true
+  enable_prefix_caching: false
+  tensor_parallel_size: 1
+  block_size: 16
+  gpu_memory_utilization: 0.9
+  max_num_batched_tokens: 8192
+  max_num_seqs: 1024
+  hf_overrides:
+    num_hidden_layers: 1
+    intermediate_size: 4096
+    num_attention_heads: 16
+    vocab_size: 250002
+    head_dim: 64
+  dtype: float16
+  max_model_len: 512
+  runner: pooling
+  pooler_config: PoolerConfig(task='embed', pooling_type=None, seq_pooling_type='MEAN',
+    tok_pooling_type='ALL', use_activation=None, dimensions=None, enable_chunked_processing=False,
+    max_embed_len=512, logit_bias=None, step_tag_id=None, returned_token_ids=None)
+  worker_extension_cls: profiler.core.hooks.extension.Extension
+  model: /tmp/profiler_model_grx5ev65
+measurement_iterations: 3
+encoder_grid:
+  max_tokens: 8192
+  max_sequences: 1024
+  max_model_len: 512
+skew_profile:
+  enabled: false
+skew_fit:
+  enabled: false

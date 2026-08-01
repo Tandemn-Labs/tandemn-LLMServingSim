@@ -18,6 +18,11 @@ class Router:
         self.prefill_instances = len(self.prefill_schedulers)
         self.decode_schedulers = [s for s in schedulers if s.pd_type == "decode"]
         self.decode_instances = len(self.decode_schedulers)
+        tasks = {scheduler.task for scheduler in schedulers}
+        if len(tasks) != 1:
+            raise ValueError("A simulation run cannot mix generation and encoder tasks")
+        self.task = next(iter(tasks))
+        self.is_encoder = self.task != "generate"
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
         self.seed = seed
@@ -122,6 +127,8 @@ class Router:
                     break
                 row = json.loads(line)
                 if 'sub_requests' in row:
+                    if self.is_encoder:
+                        raise ValueError("Agentic sessions are not supported for encoder tasks")
                     self._load_agentic_session(row, enable_prefix_caching)
                 else:
                     self._load_flat_request(row, enable_prefix_caching)
@@ -138,13 +145,21 @@ class Router:
 
     def _load_flat_request(self, row, enable_prefix_caching):
         """Load a single flat request into pending queue."""
+        input_tokens = int(row['input_toks'])
+        arrival_time = int(row['arrival_time_ns'])
+        if input_tokens <= 0:
+            raise ValueError("input_toks must be a positive integer")
+        if arrival_time < 0:
+            raise ValueError("arrival_time_ns must be non-negative")
         req_id = self._next_request_id
         self._next_request_id += 1
         req_data = {
             'index': req_id,
-            'input_toks': int(row['input_toks']),
-            'output_toks': int(row['input_toks'] + row['output_toks']),
-            'arrival_time_ns': int(row['arrival_time_ns']),
+            'input_toks': input_tokens,
+            'output_toks': input_tokens if self.is_encoder else int(
+                input_tokens + row['output_toks']
+            ),
+            'arrival_time_ns': arrival_time,
         }
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])

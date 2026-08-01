@@ -1,0 +1,53 @@
+# Kimi K2 uses the DeepSeek-V3 decoder implementation with MLA and MoE.
+# Its first block is dense, so two layers retain one dense MLP and one MoE
+# block for forced-routing profiling. The fixture holds one EP8 rank's 48
+# routed experts; the simulator retains the full 384-expert model config.
+profile_hf_overrides:
+  num_hidden_layers: 2
+  n_routed_experts: 48
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, mla_attention]
+  post_attn: [layernorm]
+  mlp_dense: [gate_up_proj, act_fn, down_proj]
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      exclude_within: DeepseekV2MLAAttention
+      tp_stable: true
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+      within: DeepseekV2MLP
+      exclude_within: DeepseekV2MoE
+    act_fn:
+      vllm: SiluAndMul
+      within: DeepseekV2MLP
+      exclude_within: DeepseekV2MoE
+    down_proj:
+      vllm: RowParallelLinear
+      within: DeepseekV2MLP
+      exclude_within: DeepseekV2MoE
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV3ForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    mla_attention:
+      vllm: DeepseekV2MLAAttention
+  moe:
+    moe:
+      vllm: DeepseekV2MoE

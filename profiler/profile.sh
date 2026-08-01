@@ -35,7 +35,7 @@ HARDWARE="RTXPRO6000"
 # =============================================================================
 
 # --- TP sweep ---------------------------------------------------------------
-# Comma-separated list; must include 1.
+# Comma-separated list. Include only the TP degrees you intend to simulate.
 TP_DEGREES="1,2"
 
 # --- Engine kwargs ----------------------------------------------------------

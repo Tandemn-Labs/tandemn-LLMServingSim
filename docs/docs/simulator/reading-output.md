@@ -46,6 +46,10 @@ The bundled `outputs/example_*_run.csv` files (one per scenario in
 | `TPOT` | int (ns) | Mean time-per-output-token: `(latency - TTFT) // (output - 1)` (or `0` when `output == 1`) |
 | `ITL` | string | Inter-token latencies, ns. Serialized Python list, e.g. `"[7780422, 7779379, ...]"` |
 
+For encoder embedding/reranking requests, `output` and `TPOT` are `0`,
+`TTFT` remains `-1`, and `ITL` is empty. Use `latency` for the complete
+one-shot request and `queuing_delay` for scheduler wait time.
+
 All times are in **nanoseconds**. Divide by `1e9` for seconds, `1e6`
 for milliseconds. Column names use spaces, not underscores; quote
 them in pandas (`df["instance id"]`).

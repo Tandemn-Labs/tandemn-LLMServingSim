@@ -40,6 +40,8 @@ SHARD_FIELDS: list[str] = [
     "intermediate_size",
     "num_attention_heads",
     "num_key_value_heads",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
     "vocab_size",
 ]
 
@@ -105,24 +107,32 @@ class LayerEntry(BaseModel):
     """If True, profile this layer only at TP=1 and replicate the
     results into every tp{N}/ folder."""
 
+    exclude_within: str | None = None
+    """Skip matching a node nested under this ancestor class."""
+
 
 class Catalog(BaseModel):
     """The full layer catalog, grouped by profile kind.
 
     Grouping is at the top level (rather than as an ``as:`` field on
-    each entry) so that the file reads as four coherent blocks.
+    each entry) so that the file reads as coherent category blocks.
     """
     model_config = ConfigDict(extra="forbid")
 
     dense: dict[str, LayerEntry] = Field(default_factory=dict)
     per_sequence: dict[str, LayerEntry] = Field(default_factory=dict)
     attention: dict[str, LayerEntry] = Field(default_factory=dict)
+    linear_attention: dict[str, LayerEntry] = Field(default_factory=dict)
+    encoder: dict[str, LayerEntry] = Field(default_factory=dict)
     moe: dict[str, LayerEntry] = Field(default_factory=dict)
 
     def all_entries(self) -> list[tuple[str, str, LayerEntry]]:
         """Flatten to ``[(profile_kind, layer_name, entry), ...]``."""
         out: list[tuple[str, str, LayerEntry]] = []
-        for kind in ("dense", "per_sequence", "attention", "moe"):
+        for kind in (
+            "dense", "per_sequence", "attention", "linear_attention",
+            "encoder", "moe",
+        ):
             for name, entry in getattr(self, kind).items():
                 out.append((kind, name, entry))
         return out
@@ -140,12 +150,15 @@ class Sequence(BaseModel):
     post_attn: list[str] = Field(default_factory=list)
     mlp_dense: list[str] = Field(default_factory=list)
     mlp_moe: list[str] = Field(default_factory=list)
+    attention_by_type: dict[str, list[str]] = Field(default_factory=dict)
     head: list[str] = Field(default_factory=list)
 
     def all_layers(self) -> list[str]:
         return [
             *self.prologue, *self.pre_attn, *self.post_attn,
-            *self.mlp_dense, *self.mlp_moe, *self.head,
+            *self.mlp_dense, *self.mlp_moe,
+            *(layer for layers in self.attention_by_type.values() for layer in layers),
+            *self.head,
         ]
 
 
@@ -160,6 +173,11 @@ class Architecture(BaseModel):
 
     catalog: Catalog
     sequence: Sequence | None = None
+    sequence_by_architecture: dict[str, Sequence] = Field(default_factory=dict)
+    profile_hf_overrides: dict[str, Any] = Field(default_factory=dict)
+    profile_pooler_by_architecture: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+    )
 
     # ------------------------------------------------------------------
     # Validation
@@ -174,8 +192,9 @@ class Architecture(BaseModel):
                 raise ValueError(f"Layer name {name!r} appears twice in catalog")
             seen.add(name)
 
-        # Exactly one attention entry.
-        if len(self.catalog.attention) != 1:
+        # Decoder models have one causal attention entry. Encoder-only models
+        # use catalog.encoder instead because their kernel has no KV history.
+        if not self.catalog.encoder and len(self.catalog.attention) != 1:
             raise ValueError(
                 f"catalog.attention must have exactly 1 entry; got "
                 f"{len(self.catalog.attention)}"
@@ -197,9 +216,12 @@ class Architecture(BaseModel):
 
         # Every sequence entry must be a canonical name declared in the
         # catalog — catches typos before a profile/simulation run.
+        sequences = list(self.sequence_by_architecture.values())
         if self.sequence is not None:
+            sequences.append(self.sequence)
+        for sequence in sequences:
             catalog_names = {n for _, n, _ in self.catalog.all_entries()}
-            unknown = [n for n in self.sequence.all_layers() if n not in catalog_names]
+            unknown = [n for n in sequence.all_layers() if n not in catalog_names]
             if unknown:
                 raise ValueError(
                     f"sequence references names not in catalog: {sorted(set(unknown))}"
@@ -214,6 +236,19 @@ class Architecture(BaseModel):
     def has_moe(self) -> bool:
         return bool(self.catalog.moe)
 
+    def is_encoder(self) -> bool:
+        return bool(self.catalog.encoder)
+
+    def for_model_architecture(self, model_architecture: str | None) -> "Architecture":
+        if model_architecture in self.sequence_by_architecture:
+            return self.model_copy(update={
+                "sequence": self.sequence_by_architecture[model_architecture],
+            })
+        return self
+
+    def pooler_config_for(self, model_architecture: str | None) -> dict[str, Any] | None:
+        return self.profile_pooler_by_architecture.get(model_architecture)
+
     def has_tp_dependent_work(self, tp: int) -> bool:
         """True iff this TP pass has any non-tp_stable layers to profile."""
         if tp == 1:
@@ -224,7 +259,10 @@ class Architecture(BaseModel):
         return False
 
 
-def load_architecture(path: Path) -> Architecture:
+def load_architecture(
+    path: Path,
+    model_architecture: str | None = None,
+) -> Architecture:
     """Parse an architecture yaml into an ``Architecture``."""
     with path.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
@@ -232,7 +270,16 @@ def load_architecture(path: Path) -> Architecture:
         raise ValueError(
             f"{path}: top-level must be a mapping, got {type(raw).__name__}"
         )
-    return Architecture.model_validate(raw)
+    architecture = Architecture.model_validate(raw)
+    if (
+        architecture.sequence_by_architecture
+        and model_architecture not in architecture.sequence_by_architecture
+    ):
+        raise ValueError(
+            f"{path}: unsupported model architecture {model_architecture!r}; "
+            f"expected one of {sorted(architecture.sequence_by_architecture)}"
+        )
+    return architecture.for_model_architecture(model_architecture)
 
 
 def architecture_hash(path: Path) -> str:
@@ -336,7 +383,7 @@ class ProfileArgs:
             ``vllm.LLM(model=...)``.
         hardware: Free-form hardware label that becomes an output
             folder name (e.g. "H100", "A6000", "RTXPRO6000").
-        tp_degrees: Which TP shardings to sweep. Must include 1.
+        tp_degrees: Which TP shardings to sweep.
         variant: Free-form output folder label under the model's
             directory. If omitted at the CLI, auto-derived from
             ``dtype`` + ``kv_cache_dtype`` so that profiles with
@@ -376,6 +423,9 @@ class ProfileArgs:
     this dict to a temporary directory as ``config.json`` and points
     vLLM there, so HF hub access is never required and custom-shape
     profiling is one file-edit away."""
+
+    model_architecture: str | None = None
+    pooler_config: dict[str, Any] | None = None
 
     # Attention grid
     attention_max_kv: int = 16384
@@ -457,7 +507,17 @@ class ProfileArgs:
         weight_dtype = self.dtype
         if weight_dtype is None and self.model_config:
             weight_dtype = self.model_config.get("torch_dtype")
-        parts = [_short_dtype(weight_dtype) if weight_dtype else "default"]
+        weight_label = _short_dtype(weight_dtype) if weight_dtype else "default"
+        parts = [weight_label]
+
+        quantization = self.model_config.get("quantization_config") if self.model_config else None
+        quant_method = (
+            str(quantization.get("quant_method", "")).lower()
+            if isinstance(quantization, dict)
+            else ""
+        )
+        if quant_method == "fp8" and weight_label != "fp8":
+            parts.append("fp8")
 
         if self.kv_cache_dtype and self.kv_cache_dtype != "auto":
             parts.append(f"kv{_short_dtype(self.kv_cache_dtype)}")
