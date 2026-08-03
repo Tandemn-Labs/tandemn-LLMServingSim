@@ -66,6 +66,46 @@ def _runtime_limit(value):
     return float('inf') if value == 0 else value
 
 
+def _instance_metrics(scheduler, current):
+    """Return the simulator's instantaneous per-instance serving gauges."""
+    memory = scheduler.memory
+    kv_capacity = memory.npu_mem - memory.weight
+    kvcache_hit_rate = None
+    if scheduler.enable_prefix_caching:
+        requested, hit = memory.npu_prefix_cache.return_prefix_info()
+        if requested:
+            kvcache_hit_rate = hit / requested
+    return {
+        "gpu_mem_used_fraction": memory.npu_used / memory.npu_mem if memory.npu_mem else 0.0,
+        "vram_headroom_gb": (memory.npu_mem - memory.npu_used) / GB_TO_BYTE,
+        "kv_cache_util": (
+            max(0.0, min(1.0, (memory.npu_used - memory.weight) / kv_capacity))
+            if kv_capacity > 0 else 0.0
+        ),
+        "live_batch_size": sum(len(batch.requests) for batch in scheduler.inflight),
+        "depth_req_q": sum(req.arrival <= current for req in scheduler.request),
+        "kvcache_hit_rate": kvcache_hit_rate,
+    }
+
+
+def _print_instance_metrics(instance_id, scheduler, current):
+    metrics = _instance_metrics(scheduler, current)
+    kvcache_hit_rate = metrics["kvcache_hit_rate"]
+    line = (
+        f"SIM_METRICS instance={instance_id} "
+        f"gpu_mem_used_fraction={metrics['gpu_mem_used_fraction']:.6f} "
+        f"vram_headroom_gb={metrics['vram_headroom_gb']:.6f} "
+        f"kv_cache_util={metrics['kv_cache_util']:.6f} "
+        f"live_batch_size={metrics['live_batch_size']} "
+        f"depth_req_q={metrics['depth_req_q']}"
+    )
+    if kvcache_hit_rate is None:
+        line += " kvcache_hit_rate=N/A"
+    else:
+        line += f" kvcache_hit_rate={kvcache_hit_rate:.6f}"
+    print(line, flush=True)
+
+
 def _cluster_config_path(path):
     if os.path.isabs(path):
         return path
@@ -840,6 +880,7 @@ def main():
                 if schedulers[inst_id].enable_prefix_caching:
                     line += schedulers[inst_id].memory.npu_prefix_cache.format_prefix_info()
                 print_markup(line)
+                _print_instance_metrics(inst_id, schedulers[inst_id], current)
 
             ######### Per Node Metrics #########
             if node2inst_mapping:
@@ -945,6 +986,7 @@ def main():
             # check if all instances are done
             if len(done_instance) == num_instances:
                 for inst_idx in range(num_instances):
+                    _print_instance_metrics(inst_idx, schedulers[inst_idx], current)
                     schedulers[inst_idx].memory.free_prefix_cache()
                     schedulers[inst_idx].memory.free_weight()
                 
