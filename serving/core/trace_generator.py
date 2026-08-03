@@ -1710,6 +1710,30 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 # ======================================================================
 
 # Wrapper function that creates trace for an instance
+def _trace_collective_wire_bytes(rows, tp_size, ep_total):
+    """Return modeled per-rank ring traffic represented by trace collectives."""
+    wire_bytes = 0.0
+    for row in rows:
+        if row and row[0] == "EXPERT" and len(row) >= 4:
+            comm_type, comm_size = row[2], row[3]
+        elif len(row) >= 10:
+            comm_type, comm_size = row[8], row[9]
+        else:
+            continue
+
+        collective = comm_type.split(":", 1)[0].lower()
+        if collective == "none":
+            continue
+        try:
+            comm_size = int(comm_size)
+        except ValueError:
+            continue
+        group_size = ep_total if collective in ("allgather", "reducescatter", "alltoall") else tp_size
+        if group_size > 1 and comm_size > 0:
+            wire_bytes += total_ring_data(comm_size, group_size, collective)
+    return wire_bytes
+
+
 def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None, node_id=0, instance_id=0,
                    max_num_batched_tokens=2048, max_num_seqs=None,
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
@@ -1815,6 +1839,11 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
         power_model.print_log(node_id)
 
     result = mem + dic
+    collective_wire_bytes = _trace_collective_wire_bytes(result, tp_size, ep_total)
+    pipeline_wire_bytes = (
+        2 * (pp_size - 1) / pp_size * batch.total_len * config['hidden_size'] * fp
+        if pp_size > 1 else 0.0
+    )
 
     with open(output_path, 'w') as f:
         # instance type
@@ -1838,7 +1867,13 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                 f.write(formatter(new_string, *result[i][1:]))
             else:
                 f.write(formatter(' '.join(result[i]),'','','','','','','','','',''))
-    return
+    return {
+        "comm_wire_bytes": collective_wire_bytes + pipeline_wire_bytes,
+        "collective_wire_bytes": collective_wire_bytes,
+        "pipeline_wire_bytes": pipeline_wire_bytes,
+        "scheduled_tokens": batch.total_len,
+        "decode_tokens": batch.num_decode,
+    }
 
 
 # ======================================================================

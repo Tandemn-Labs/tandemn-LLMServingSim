@@ -75,6 +75,22 @@ class Scheduler:
         else:
             return self.schedule_base(current, sys, batch_id)
 
+    def get_kv_pressure_score(self):
+        """Return peak requested KV demand divided by modeled KV capacity."""
+        requests = {req.id: req for req in self.request}
+        for batch in self.inflight:
+            for req in batch.requests:
+                requests[req.id] = req
+
+        demand = sum(
+            self.memory.get_total_kv_for_tokens(req.output)
+            for req in requests.values()
+        )
+        capacity = self.memory.npu_mem - self.memory.weight
+        if capacity <= 0:
+            return float('inf') if demand else 0.0
+        return demand / capacity
+
     def schedule_encoder(self, current, sys, batch_id=-1):
         """Pack complete encoder requests into a single one-shot batch."""
         if sys != self.start_npu:

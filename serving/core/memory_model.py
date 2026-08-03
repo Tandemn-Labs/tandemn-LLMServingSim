@@ -355,10 +355,17 @@ class MemoryModel():
     # get the total size of current kv cache for the request
     # used when adding prefilled request to decode instance.
     def get_total_kv(self, req):
+        return self.get_total_kv_for_tokens(req.num_computed_tokens)
+
+    def get_total_kv_for_tokens(self, tokens):
+        """Return per-rank, block-rounded KV bytes for one sequence length."""
+        tokens = max(int(tokens), 0)
+        if tokens == 0:
+            return 0
         # ceil division: (n + block_size - 1) // block_size
-        num_blocks = (req.num_computed_tokens + self.block_size - 1) // self.block_size
+        num_blocks = (tokens + self.block_size - 1) // self.block_size
         total = self.get_kv(num_blocks * self.block_size)
-        if self.is_qwen3_next and req.num_computed_tokens > 0:
+        if self.is_qwen3_next:
             total += self._qwen3_next_state_bytes()
         return total
 

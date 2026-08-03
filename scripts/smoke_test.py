@@ -179,7 +179,7 @@ def write_summary(path, rows):
     fields = [
         "hardware", "model", "variant", "tp", "status", "profile_gaps", "returncode", "log", "output",
         "gpu_mem_used_fraction", "vram_headroom_gb", "kv_cache_util", "live_batch_size", "depth_req_q",
-        "kvcache_hit_rate",
+        "kvcache_hit_rate", "per_tok_comm_bytes", "kv_pressure_score_peak",
     ]
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -188,6 +188,7 @@ def write_summary(path, rows):
 
 
 _SIM_METRICS_RE = re.compile(r"^SIM_METRICS instance=(\d+) (.+)$")
+_SIM_METRICS_SUMMARY_RE = re.compile(r"^SIM_METRICS_SUMMARY instance=(\d+) (.+)$")
 
 
 def read_sim_metrics(path, instance_id=0):
@@ -203,6 +204,19 @@ def read_sim_metrics(path, instance_id=0):
             key: "" if value == "N/A" else value
             for key, value in (token.split("=", 1) for token in match.group(2).split())
         }
+    return metrics
+
+
+def read_sim_metric_summary(path, instance_id=0):
+    """Return the final machine-readable simulator summary for one instance."""
+    metrics = {}
+    if not path.is_file():
+        return metrics
+    for line in path.read_text().splitlines():
+        match = _SIM_METRICS_SUMMARY_RE.match(line)
+        if match is None or int(match.group(1)) != instance_id:
+            continue
+        metrics = dict(token.split("=", 1) for token in match.group(2).split())
     return metrics
 
 
@@ -252,6 +266,7 @@ def run_case(root, run_root, index, total, case, timeout):
         if result["returncode"] or not output.is_file() or output.stat().st_size == 0:
             result["status"] = "FAIL"
         result.update(read_sim_metrics(log))
+        result.update(read_sim_metric_summary(log))
     except subprocess.TimeoutExpired:
         result["status"] = "TIMEOUT"
     return result

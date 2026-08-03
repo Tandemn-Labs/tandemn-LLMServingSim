@@ -207,6 +207,38 @@ they show up in multiple pages:
 Each of these is explained in the page that owns it; this list is
 just so you have a map when something cross-references.
 
+## Modeled serving metrics
+
+The simulator prints `SIM_METRICS` while a run is active and a
+`SIM_METRICS_SUMMARY` line before it frees simulated memory. These are
+modeled values derived from scheduler state and emitted traces, not DCGM,
+NCCL, or vLLM telemetry from physical GPUs.
+
+`kv_cache_util` is current modeled KV occupancy:
+
+```text
+currently allocated KV bytes / modeled KV capacity
+```
+
+`kv_pressure_score` is a capacity-planning ratio. It uses every waiting or
+in-flight request's requested final context length, block-rounds each request
+through the model's KV layout, and divides the resulting demand by modeled KV
+capacity. Values above `1` mean the requested workload exceeds that capacity.
+The final summary reports the maximum value seen during the run as
+`kv_pressure_score_peak`.
+
+`per_tok_comm_bytes` is modeled per-rank wire traffic divided by all scheduled
+prefill and decode tokens:
+
+```text
+(TP/EP collective ring traffic + modeled PP activation handoffs)
+/ scheduled prefill and decode tokens
+```
+
+Its unit is bytes per scheduled token. It is not decode-only and is not a
+physical NVLink or PCIe TX/RX counter. The value is `N/A` until the instance
+has generated at least one batch trace.
+
 ## Where to go next
 
 If you want to follow a single request from JSONL all the way to

@@ -66,8 +66,12 @@ def _runtime_limit(value):
     return float('inf') if value == 0 else value
 
 
-def _instance_metrics(scheduler, current):
-    """Return the simulator's instantaneous per-instance serving gauges."""
+def _instance_metrics(scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0):
+    """Return per-instance gauges and modeled bytes per scheduled token.
+
+    ``per_tok_comm_bytes`` is per-rank modeled wire traffic divided by all
+    scheduled prefill and decode tokens, not only generated decode tokens.
+    """
     memory = scheduler.memory
     kv_capacity = memory.npu_mem - memory.weight
     kvcache_hit_rate = None
@@ -85,11 +89,15 @@ def _instance_metrics(scheduler, current):
         "live_batch_size": sum(len(batch.requests) for batch in scheduler.inflight),
         "depth_req_q": sum(req.arrival <= current for req in scheduler.request),
         "kvcache_hit_rate": kvcache_hit_rate,
+        "kv_pressure_score": scheduler.get_kv_pressure_score(),
+        "per_tok_comm_bytes": (
+            comm_wire_bytes / scheduled_tokens if scheduled_tokens else None
+        ),
     }
 
 
-def _print_instance_metrics(instance_id, scheduler, current):
-    metrics = _instance_metrics(scheduler, current)
+def _print_instance_metrics(instance_id, scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0):
+    metrics = _instance_metrics(scheduler, current, comm_wire_bytes, scheduled_tokens)
     kvcache_hit_rate = metrics["kvcache_hit_rate"]
     line = (
         f"SIM_METRICS instance={instance_id} "
@@ -97,13 +105,26 @@ def _print_instance_metrics(instance_id, scheduler, current):
         f"vram_headroom_gb={metrics['vram_headroom_gb']:.6f} "
         f"kv_cache_util={metrics['kv_cache_util']:.6f} "
         f"live_batch_size={metrics['live_batch_size']} "
-        f"depth_req_q={metrics['depth_req_q']}"
+        f"depth_req_q={metrics['depth_req_q']} "
+        f"kv_pressure_score={metrics['kv_pressure_score']:.6f}"
     )
     if kvcache_hit_rate is None:
         line += " kvcache_hit_rate=N/A"
     else:
         line += f" kvcache_hit_rate={kvcache_hit_rate:.6f}"
+    if metrics["per_tok_comm_bytes"] is None:
+        line += " per_tok_comm_bytes=N/A"
+    else:
+        line += f" per_tok_comm_bytes={metrics['per_tok_comm_bytes']:.6f}"
     print(line, flush=True)
+
+
+def _print_instance_metric_summary(instance_id, kv_pressure_score_peak):
+    print(
+        f"SIM_METRICS_SUMMARY instance={instance_id} "
+        f"kv_pressure_score_peak={kv_pressure_score_peak:.6f}",
+        flush=True,
+    )
 
 
 def _cluster_config_path(path):
@@ -569,6 +590,9 @@ def main():
     total_gen = 0
     total_latency = 0
     req_cnt = 0
+    comm_wire_bytes = [0.0 for _ in range(num_instances)]
+    comm_scheduled_tokens = [0 for _ in range(num_instances)]
+    kv_pressure_score_peak = [0.0 for _ in range(num_instances)]
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = router.get_first_arrival_time()
@@ -662,6 +686,10 @@ def main():
 
         # schedule requests
         new_req = schedulers[instance_id].schedule(current, sys, id)
+        kv_pressure_score_peak[instance_id] = max(
+            kv_pressure_score_peak[instance_id],
+            schedulers[instance_id].get_kv_pressure_score(),
+        )
         responded = False  # track whether we already sent a response to ASTRA-Sim
 
         # Check if a pre-generated workload is ready for this instance (from DP sync)
@@ -708,20 +736,22 @@ def main():
                         batch, nid = dp_pending[dg][inst_id]
                         inst = instances[inst_id]
                         inst_cfg = instance_runtime_configs[inst_id]
-                        generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
-                                       inst["local_ep"], inst["ep_total"], inst["pd_type"],
-                                       nid, inst_id,
-                                       inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
-                                       placement[inst_id], block_mode_on[inst_id],
-                                       expert_routing_policy, inst_cfg["enable_prefix_caching"],
-                                       inst_cfg["enable_attn_offloading"],
-                                       power_model, pim_models[nid],
-                                       inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                       dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
-                                       tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
-                                       dp_sum_total_len=sum_total_len,
-                                       enable_block_copy=inst_cfg["enable_block_copy"],
-                                       inputs_root=run_paths.inputs_root)
+                        trace_stats = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
+                                                     inst["local_ep"], inst["ep_total"], inst["pd_type"],
+                                                     nid, inst_id,
+                                                     inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
+                                                     placement[inst_id], block_mode_on[inst_id],
+                                                     expert_routing_policy, inst_cfg["enable_prefix_caching"],
+                                                     inst_cfg["enable_attn_offloading"],
+                                                     power_model, pim_models[nid],
+                                                     inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
+                                                     dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+                                                     tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                                     dp_sum_total_len=sum_total_len,
+                                                     enable_block_copy=inst_cfg["enable_block_copy"],
+                                                     inputs_root=run_paths.inputs_root)
+                        comm_wire_bytes[inst_id] += trace_stats["comm_wire_bytes"]
+                        comm_scheduled_tokens[inst_id] += trace_stats["scheduled_tokens"]
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -775,20 +805,22 @@ def main():
                             batch, nid = dp_pending[dg][inst_id]
                             inst = instances[inst_id]
                             inst_cfg = instance_runtime_configs[inst_id]
-                            generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
-                                           inst["local_ep"], inst["ep_total"], inst["pd_type"],
-                                           nid, inst_id,
-                                           inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
-                                           placement[inst_id], block_mode_on[inst_id],
-                                           expert_routing_policy, inst_cfg["enable_prefix_caching"],
-                                           inst_cfg["enable_attn_offloading"],
-                                           power_model, pim_models[nid],
-                                           inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                           dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
-                                           tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
-                                           dp_sum_total_len=sum_total_len,
-                                           enable_block_copy=inst_cfg["enable_block_copy"],
-                                           inputs_root=run_paths.inputs_root)
+                            trace_stats = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
+                                                         inst["local_ep"], inst["ep_total"], inst["pd_type"],
+                                                         nid, inst_id,
+                                                         inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
+                                                         placement[inst_id], block_mode_on[inst_id],
+                                                         expert_routing_policy, inst_cfg["enable_prefix_caching"],
+                                                         inst_cfg["enable_attn_offloading"],
+                                                         power_model, pim_models[nid],
+                                                         inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
+                                                         dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+                                                         tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                                         dp_sum_total_len=sum_total_len,
+                                                         enable_block_copy=inst_cfg["enable_block_copy"],
+                                                         inputs_root=run_paths.inputs_root)
+                            comm_wire_bytes[inst_id] += trace_stats["comm_wire_bytes"]
+                            comm_scheduled_tokens[inst_id] += trace_stats["scheduled_tokens"]
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -812,19 +844,21 @@ def main():
                 else:
                     # Independent instance: generate trace immediately
                     inst_cfg = instance_runtime_configs[instance_id]
-                    generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
-                                   instance["local_ep"], instance["ep_total"],
-                                   instance["pd_type"],
-                                   node_id, instance_id,
-                                   inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
-                                   placement[instance_id], block_mode_on[instance_id],
-                                   expert_routing_policy, inst_cfg["enable_prefix_caching"],
-                                   inst_cfg["enable_attn_offloading"], power_model, pim_models[node_id],
-                                   inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                   dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
-                                   tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
-                                   enable_block_copy=inst_cfg["enable_block_copy"],
-                                   inputs_root=run_paths.inputs_root)
+                    trace_stats = generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
+                                                 instance["local_ep"], instance["ep_total"],
+                                                 instance["pd_type"],
+                                                 node_id, instance_id,
+                                                 inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
+                                                 placement[instance_id], block_mode_on[instance_id],
+                                                 expert_routing_policy, inst_cfg["enable_prefix_caching"],
+                                                 inst_cfg["enable_attn_offloading"], power_model, pim_models[node_id],
+                                                 inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
+                                                 dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+                                                 tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
+                                                 enable_block_copy=inst_cfg["enable_block_copy"],
+                                                 inputs_root=run_paths.inputs_root)
+                    comm_wire_bytes[instance_id] += trace_stats["comm_wire_bytes"]
+                    comm_scheduled_tokens[instance_id] += trace_stats["scheduled_tokens"]
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -880,7 +914,10 @@ def main():
                 if schedulers[inst_id].enable_prefix_caching:
                     line += schedulers[inst_id].memory.npu_prefix_cache.format_prefix_info()
                 print_markup(line)
-                _print_instance_metrics(inst_id, schedulers[inst_id], current)
+                _print_instance_metrics(
+                    inst_id, schedulers[inst_id], current,
+                    comm_wire_bytes[inst_id], comm_scheduled_tokens[inst_id],
+                )
 
             ######### Per Node Metrics #########
             if node2inst_mapping:
@@ -986,7 +1023,11 @@ def main():
             # check if all instances are done
             if len(done_instance) == num_instances:
                 for inst_idx in range(num_instances):
-                    _print_instance_metrics(inst_idx, schedulers[inst_idx], current)
+                    _print_instance_metrics(
+                        inst_idx, schedulers[inst_idx], current,
+                        comm_wire_bytes[inst_idx], comm_scheduled_tokens[inst_idx],
+                    )
+                    _print_instance_metric_summary(inst_idx, kv_pressure_score_peak[inst_idx])
                     schedulers[inst_idx].memory.free_prefix_cache()
                     schedulers[inst_idx].memory.free_weight()
                 
