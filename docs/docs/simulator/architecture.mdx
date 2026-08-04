@@ -239,6 +239,23 @@ Its unit is bytes per scheduled token. It is not decode-only and is not a
 physical NVLink or PCIe TX/RX counter. The value is `N/A` until the instance
 has generated at least one batch trace.
 
+`output_length_observed` is the average generated length of generation
+requests completed during the current simulator reporting window:
+
+```text
+delta(output_tokens_sum) / delta(completed_generation_requests)
+```
+
+For each completed generation request, the simulator adds
+`req.output - req.original_input` to `output_tokens_sum`. Prefill-only
+instances and encoder models report `N/A`. In P/D mode, the request is counted
+on decode completion, not when prefill transfers it to the decode instance.
+
+This is exact under simulator semantics, but it is not sampled EOS behavior:
+the workload supplies the requested output length in advance, and the
+simulator does not currently model early EOS, cancellation, or
+sampling-dependent output lengths.
+
 ## Where to go next
 
 If you want to follow a single request from JSONL all the way to

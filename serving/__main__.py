@@ -66,7 +66,12 @@ def _runtime_limit(value):
     return float('inf') if value == 0 else value
 
 
-def _instance_metrics(scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0):
+def _instance_metrics(
+    scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0,
+    input_length_observed=None, output_length_observed=None,
+    prefill_iteration_counts_per_second=None,
+    decode_itr_counts_per_second=None,
+):
     """Return per-instance gauges and modeled bytes per scheduled token.
 
     ``per_tok_comm_bytes`` is per-rank modeled wire traffic divided by all
@@ -90,14 +95,29 @@ def _instance_metrics(scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=
         "depth_req_q": sum(req.arrival <= current for req in scheduler.request),
         "kvcache_hit_rate": kvcache_hit_rate,
         "kv_pressure_score": scheduler.get_kv_pressure_score(),
+        "input_length_observed": input_length_observed,
+        "output_length_observed": output_length_observed,
+        "prefill_iteration_counts_per_second": prefill_iteration_counts_per_second,
+        "decode_itr_counts_per_second": decode_itr_counts_per_second,
+        "expert_inbalance": 0.0,
+        "pd_inbalance": 0.0,
         "per_tok_comm_bytes": (
             comm_wire_bytes / scheduled_tokens if scheduled_tokens else None
         ),
     }
 
 
-def _print_instance_metrics(instance_id, scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0):
-    metrics = _instance_metrics(scheduler, current, comm_wire_bytes, scheduled_tokens)
+def _print_instance_metrics(
+    instance_id, scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0,
+    input_length_observed=None, output_length_observed=None,
+    prefill_iteration_counts_per_second=None,
+    decode_itr_counts_per_second=None,
+):
+    metrics = _instance_metrics(
+        scheduler, current, comm_wire_bytes, scheduled_tokens,
+        input_length_observed, output_length_observed,
+        prefill_iteration_counts_per_second, decode_itr_counts_per_second,
+    )
     kvcache_hit_rate = metrics["kvcache_hit_rate"]
     line = (
         f"SIM_METRICS instance={instance_id} "
@@ -112,6 +132,29 @@ def _print_instance_metrics(instance_id, scheduler, current, comm_wire_bytes=0.0
         line += " kvcache_hit_rate=N/A"
     else:
         line += f" kvcache_hit_rate={kvcache_hit_rate:.6f}"
+    if metrics["input_length_observed"] is None:
+        line += " input_length_observed=N/A"
+    else:
+        line += f" input_length_observed={metrics['input_length_observed']:.6f}"
+    if metrics["output_length_observed"] is None:
+        line += " output_length_observed=N/A"
+    else:
+        line += f" output_length_observed={metrics['output_length_observed']:.6f}"
+    if metrics["prefill_iteration_counts_per_second"] is None:
+        line += " prefill_iteration_counts_per_second=N/A"
+    else:
+        line += (
+            " prefill_iteration_counts_per_second="
+            f"{metrics['prefill_iteration_counts_per_second']:.6f}"
+        )
+    if metrics["decode_itr_counts_per_second"] is None:
+        line += " decode_itr_counts_per_second=N/A"
+    else:
+        line += (
+            " decode_itr_counts_per_second="
+            f"{metrics['decode_itr_counts_per_second']:.6f}"
+        )
+    line += " expert_inbalance=0.000000 pd_inbalance=0.000000"
     if metrics["per_tok_comm_bytes"] is None:
         line += " per_tok_comm_bytes=N/A"
     else:
@@ -593,6 +636,17 @@ def main():
     comm_wire_bytes = [0.0 for _ in range(num_instances)]
     comm_scheduled_tokens = [0 for _ in range(num_instances)]
     kv_pressure_score_peak = [0.0 for _ in range(num_instances)]
+    input_tokens_total = [0 for _ in range(num_instances)]
+    input_requests_total = [0 for _ in range(num_instances)]
+    input_tokens_last_log = [0 for _ in range(num_instances)]
+    input_requests_last_log = [0 for _ in range(num_instances)]
+    output_tokens_total = [0 for _ in range(num_instances)]
+    output_requests_total = [0 for _ in range(num_instances)]
+    output_tokens_last_log = [0 for _ in range(num_instances)]
+    output_requests_last_log = [0 for _ in range(num_instances)]
+    prefill_iterations_last_log = [0 for _ in range(num_instances)]
+    decode_iterations_last_log = [0 for _ in range(num_instances)]
+    metrics_last_time = [0 for _ in range(num_instances)]
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = router.get_first_arrival_time()
@@ -674,6 +728,20 @@ def main():
         total_gen += gen_t
         # count only finished requests
         req_cnt += len(finished_reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+        if instances[instance_id]["pd_type"] != "prefill":
+            input_tokens_total[instance_id] += sum(
+                req.original_input for req in finished_reqs
+            )
+            input_requests_total[instance_id] += len(finished_reqs)
+        if (
+            instances[instance_id]["pd_type"] != "prefill"
+            and not schedulers[instance_id].is_encoder
+        ):
+            output_tokens_total[instance_id] += sum(
+                req.output - req.original_input
+                for req in finished_reqs
+            )
+            output_requests_total[instance_id] += len(finished_reqs)
 
         # Notify router of completed requests for dependency chain release
         if instances[instance_id]["pd_type"] != "prefill":
@@ -914,9 +982,37 @@ def main():
                 if schedulers[inst_id].enable_prefix_caching:
                     line += schedulers[inst_id].memory.npu_prefix_cache.format_prefix_info()
                 print_markup(line)
+                input_tokens = input_tokens_total[inst_id] - input_tokens_last_log[inst_id]
+                input_requests = input_requests_total[inst_id] - input_requests_last_log[inst_id]
+                input_length_observed = (
+                    input_tokens / input_requests if input_requests else None
+                )
+                output_tokens = output_tokens_total[inst_id] - output_tokens_last_log[inst_id]
+                output_requests = output_requests_total[inst_id] - output_requests_last_log[inst_id]
+                output_length_observed = (
+                    output_tokens / output_requests if output_requests else None
+                )
+                elapsed_ns = current - metrics_last_time[inst_id]
+                prefill_iterations = (
+                    schedulers[inst_id].prefill_iterations - prefill_iterations_last_log[inst_id]
+                )
+                decode_iterations = (
+                    schedulers[inst_id].decode_iterations - decode_iterations_last_log[inst_id]
+                )
+                prefill_rate = prefill_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
+                decode_rate = decode_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
+                input_tokens_last_log[inst_id] = input_tokens_total[inst_id]
+                input_requests_last_log[inst_id] = input_requests_total[inst_id]
+                output_tokens_last_log[inst_id] = output_tokens_total[inst_id]
+                output_requests_last_log[inst_id] = output_requests_total[inst_id]
+                prefill_iterations_last_log[inst_id] = schedulers[inst_id].prefill_iterations
+                decode_iterations_last_log[inst_id] = schedulers[inst_id].decode_iterations
+                metrics_last_time[inst_id] = current
                 _print_instance_metrics(
                     inst_id, schedulers[inst_id], current,
                     comm_wire_bytes[inst_id], comm_scheduled_tokens[inst_id],
+                    input_length_observed, output_length_observed,
+                    prefill_rate, decode_rate,
                 )
 
             ######### Per Node Metrics #########
@@ -1023,9 +1119,32 @@ def main():
             # check if all instances are done
             if len(done_instance) == num_instances:
                 for inst_idx in range(num_instances):
+                    input_tokens = input_tokens_total[inst_idx] - input_tokens_last_log[inst_idx]
+                    input_requests = input_requests_total[inst_idx] - input_requests_last_log[inst_idx]
+                    input_length_observed = (
+                        input_tokens / input_requests if input_requests else None
+                    )
+                    output_tokens = output_tokens_total[inst_idx] - output_tokens_last_log[inst_idx]
+                    output_requests = output_requests_total[inst_idx] - output_requests_last_log[inst_idx]
+                    output_length_observed = (
+                        output_tokens / output_requests if output_requests else None
+                    )
+                    elapsed_ns = current - metrics_last_time[inst_idx]
+                    prefill_iterations = (
+                        schedulers[inst_idx].prefill_iterations
+                        - prefill_iterations_last_log[inst_idx]
+                    )
+                    decode_iterations = (
+                        schedulers[inst_idx].decode_iterations
+                        - decode_iterations_last_log[inst_idx]
+                    )
+                    prefill_rate = prefill_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
+                    decode_rate = decode_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
                     _print_instance_metrics(
                         inst_idx, schedulers[inst_idx], current,
                         comm_wire_bytes[inst_idx], comm_scheduled_tokens[inst_idx],
+                        input_length_observed, output_length_observed,
+                        prefill_rate, decode_rate,
                     )
                     _print_instance_metric_summary(inst_idx, kv_pressure_score_peak[inst_idx])
                     schedulers[inst_idx].memory.free_prefix_cache()

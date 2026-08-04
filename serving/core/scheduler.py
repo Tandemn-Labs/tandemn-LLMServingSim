@@ -59,6 +59,8 @@ class Scheduler:
         self.inflight = []
         self.done = []
         self.batch_ids = -1
+        self.prefill_iterations = 0
+        self.decode_iterations = 0
 
         # memory model
         self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
@@ -790,7 +792,11 @@ class Scheduler:
             "Batch #%d is done",
             batch.batch_id,
         )
-                
+        if batch.requests and batch.prefill_q_list:
+            self.prefill_iterations += 1
+        if batch.requests and batch.decode_k_list:
+            self.decode_iterations += 1
+
         pool = []
         for req in batch.requests:
             # For chunked prefill, use computed tokens to determine prefill vs decode

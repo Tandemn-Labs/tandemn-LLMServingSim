@@ -180,6 +180,8 @@ def write_summary(path, rows):
         "hardware", "model", "variant", "tp", "status", "profile_gaps", "returncode", "log", "output",
         "gpu_mem_used_fraction", "vram_headroom_gb", "kv_cache_util", "live_batch_size", "depth_req_q",
         "kvcache_hit_rate", "per_tok_comm_bytes", "kv_pressure_score_peak",
+        "prefill_iteration_counts_per_second", "decode_itr_counts_per_second",
+        "input_length_observed", "output_length_observed", "expert_inbalance", "pd_inbalance",
     ]
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
