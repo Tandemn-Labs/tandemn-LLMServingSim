@@ -33,6 +33,13 @@ MODELS = {
     "deepseek-ai/DeepSeek-V3",
 }
 
+ROUTED_POOL_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+ROUTED_POOLS = (
+    {"pool_id": "h100-tp2", "hardware": "H100", "tp_size": 2, "pp_size": 1, "replicas": 2},
+    {"pool_id": "a100-tp2-pp2", "hardware": "A100-80GB", "tp_size": 2, "pp_size": 2, "replicas": 3},
+    {"pool_id": "l40s-tp4", "hardware": "L40S", "tp_size": 4, "pp_size": 1, "replicas": 1},
+)
+
 # Edit these values when a profile represents a different SKU or interconnect.
 HARDWARE = {
     "A10G": {"npu_mem_gb": 24, "npu_mem_bw_gbps": 600, "link_bw_gbps": 32,
@@ -156,6 +163,35 @@ def cluster_config(root, case):
     }
 
 
+def pool_cluster_config(pool):
+    """Build one homogeneous LLMServingSim cluster per routed pool."""
+    spec = HARDWARE[pool["hardware"]]
+    instance = {
+        "model_name": ROUTED_POOL_MODEL,
+        "hardware": pool["hardware"],
+        "npu_mem": {
+            "mem_size": spec["npu_mem_gb"],
+            "mem_bw": spec["npu_mem_bw_gbps"],
+            "mem_latency": 0,
+        },
+        "num_npus": pool["tp_size"] * pool["pp_size"],
+        "tp_size": pool["tp_size"],
+        "pp_size": pool["pp_size"],
+        "pd_type": None,
+        "dtype": "bfloat16",
+    }
+    return {
+        "num_nodes": 1,
+        "link_bw": spec["link_bw_gbps"],
+        "link_latency": spec["link_latency_ns"],
+        "nodes": [{
+            "num_instances": pool["replicas"],
+            "cpu_mem": {"mem_size": 512, "mem_bw": 256, "mem_latency": 0},
+            "instances": [instance.copy() for _ in range(pool["replicas"])],
+        }],
+    }
+
+
 def runtime_dtype(variant):
     if variant.startswith("fp16"):
         return "float16"
@@ -182,6 +218,7 @@ def write_summary(path, rows):
         "kvcache_hit_rate", "per_tok_comm_bytes", "kv_pressure_score_peak",
         "prefill_iteration_counts_per_second", "decode_itr_counts_per_second",
         "input_length_observed", "output_length_observed", "expert_inbalance", "pd_inbalance",
+        "comm_overhead_pct", "pipeline_bubble_fraction",
     ]
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -274,9 +311,141 @@ def run_case(root, run_root, index, total, case, timeout):
     return result
 
 
+def round_robin_route(requests, pools, cursor=0):
+    """Split requests evenly across active pools without changing arrivals."""
+    routed = {pool["pool_id"]: [] for pool in pools}
+    manifest = []
+    for index, request in enumerate(requests):
+        pool = pools[(cursor + index) % len(pools)]
+        local_index = len(routed[pool["pool_id"]])
+        routed[pool["pool_id"]].append(request)
+        manifest.append({
+            "global_request_id": f"request-{index}",
+            "pool_id": pool["pool_id"],
+            "local_index": local_index,
+        })
+    return routed, manifest, (cursor + len(requests)) % len(pools)
+
+
+def write_jsonl(path, records):
+    path.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def run_routed_pools(root, run_root, timeout):
+    """Run one global workload through independent homogeneous pool simulators."""
+    name = "routed-pools"
+    case_root = run_root / name
+    case_root.mkdir(parents=True)
+    requests = [
+        {"input_toks": 1, "output_toks": 1, "arrival_time_ns": index}
+        for index in range(6)
+    ]
+    routed, manifest, cursor = round_robin_route(requests, ROUTED_POOLS)
+    write_jsonl(case_root / "global-workload.jsonl", requests)
+    (case_root / "routing-manifest.json").write_text(
+        json.dumps({"cursor_start": 0, "cursor_end": cursor, "requests": manifest}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    processes = []
+    for pool in ROUTED_POOLS:
+        pool_root = case_root / pool["pool_id"]
+        pool_root.mkdir()
+        config = pool_root / "cluster.json"
+        workload = pool_root / "workload.jsonl"
+        output = pool_root / "requests.csv"
+        log = pool_root / "simulator.log"
+        config.write_text(json.dumps(pool_cluster_config(pool), indent=2) + "\n")
+        write_jsonl(workload, routed[pool["pool_id"]])
+        command = [
+            sys.executable, "-m", "serving",
+            "--cluster-config", str(config.relative_to(root)),
+            "--dataset", str(workload.relative_to(root)),
+            "--num-reqs", str(len(routed[pool["pool_id"]])),
+            "--request-routing-policy", "LOAD",
+            "--output", str(output),
+            "--run-id", f"{name}-{pool['pool_id']}",
+            "--log-level", "WARNING",
+        ]
+        log_file = log.open("w")
+        print(f"[routed-pools:{pool['pool_id']}] starting", flush=True)
+        process = subprocess.Popen(
+            command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env={**os.environ, "FORCE_COLOR": "1"},
+        )
+        processes.append((
+            pool,
+            output,
+            log,
+            log_file,
+            process,
+        ))
+
+    started = time.monotonic()
+    selector = selectors.DefaultSelector()
+    for pool, _, _, log_file, process in processes:
+        selector.register(process.stdout, selectors.EVENT_READ, (pool["pool_id"], log_file))
+    while any(process.poll() is None for *_, process in processes):
+        for key, _ in selector.select(timeout=0.1):
+            line = key.fileobj.readline()
+            if not line:
+                selector.unregister(key.fileobj)
+                continue
+            pool_id, log_file = key.data
+            log_file.write(line)
+            print(f"[routed-pools:{pool_id}] {line}", end="", flush=True)
+        if time.monotonic() - started >= timeout:
+            for *_, process in processes:
+                if process.poll() is None:
+                    process.kill()
+            for *_, log_file, process in processes:
+                process.wait()
+                for line in process.stdout:
+                    log_file.write(line)
+                log_file.close()
+            print(f"[routed-pools] status=TIMEOUT root={case_root}", flush=True)
+            return "TIMEOUT"
+
+    summary = {"cursor_end": cursor, "pools": {}}
+    status = "PASS"
+    for pool, output, log, log_file, process in processes:
+        for line in process.stdout:
+            log_file.write(line)
+            print(f"[routed-pools:{pool['pool_id']}] {line}", end="", flush=True)
+        log_file.close()
+        rows = []
+        if output.is_file():
+            with output.open(newline="") as output_file:
+                rows = list(csv.DictReader(output_file))
+        expected = len(routed[pool["pool_id"]])
+        if process.returncode or len(rows) != expected:
+            status = "FAIL"
+        summary["pools"][pool["pool_id"]] = {
+            "expected_requests": expected,
+            "completed_requests": len(rows),
+            "returncode": process.returncode,
+            "instance_ids": sorted({row["instance id"] for row in rows}),
+            "metrics": {
+                str(instance_id): read_sim_metrics(log, instance_id)
+                for instance_id in range(pool["replicas"])
+            },
+        }
+    summary_path = case_root / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(f"[routed-pools] status={status} summary={summary_path}", flush=True)
+    return status
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true", help="run all discovered cases")
+    parser.add_argument(
+        "--run-routed-pools",
+        action="store_true",
+        help="run the global router with independent homogeneous pools",
+    )
     parser.add_argument("--list", action="store_true", help="list discovered cases")
     parser.add_argument("--timeout", type=int, default=300, help="seconds per simulation")
     args = parser.parse_args()
@@ -285,6 +454,17 @@ def main():
         print("STACK_NOT_READY: missing Python module: yaml", file=sys.stderr)
         return 2
     cases = list(profile_cases(root))
+    if args.run_routed_pools:
+        if args.list:
+            parser.error("--list cannot be combined with --run-routed-pools")
+        problems = stack_problems(root)
+        if problems:
+            print("STACK_NOT_READY:\n" + "\n".join(f"- {item}" for item in problems), file=sys.stderr)
+            return 2
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_root = root / "outputs/smoke" / stamp
+        status = run_routed_pools(root, run_root, args.timeout)
+        return 0 if status == "PASS" else 1
     if args.list or not args.run:
         for case in cases:
             gaps = profile_gaps(root, case)

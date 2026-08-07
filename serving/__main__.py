@@ -71,6 +71,8 @@ def _instance_metrics(
     input_length_observed=None, output_length_observed=None,
     prefill_iteration_counts_per_second=None,
     decode_itr_counts_per_second=None,
+    comm_active_cycles=0, iteration_elapsed_cycles=0,
+    gpu_active_cycles=0, gpu_capacity_cycles=0,
 ):
     """Return per-instance gauges and modeled bytes per scheduled token.
 
@@ -101,6 +103,15 @@ def _instance_metrics(
         "decode_itr_counts_per_second": decode_itr_counts_per_second,
         "expert_inbalance": 0.0,
         "pd_inbalance": 0.0,
+        "comm_overhead_pct": (
+            comm_active_cycles / iteration_elapsed_cycles
+            if iteration_elapsed_cycles else None
+        ),
+        "pipeline_bubble_fraction": (
+            0.0 if scheduler.pp_size <= 1 else
+            max(0.0, min(1.0, 1.0 - gpu_active_cycles / gpu_capacity_cycles))
+            if gpu_capacity_cycles else None
+        ),
         "per_tok_comm_bytes": (
             comm_wire_bytes / scheduled_tokens if scheduled_tokens else None
         ),
@@ -112,11 +123,15 @@ def _print_instance_metrics(
     input_length_observed=None, output_length_observed=None,
     prefill_iteration_counts_per_second=None,
     decode_itr_counts_per_second=None,
+    comm_active_cycles=0, iteration_elapsed_cycles=0,
+    gpu_active_cycles=0, gpu_capacity_cycles=0,
 ):
     metrics = _instance_metrics(
         scheduler, current, comm_wire_bytes, scheduled_tokens,
         input_length_observed, output_length_observed,
         prefill_iteration_counts_per_second, decode_itr_counts_per_second,
+        comm_active_cycles, iteration_elapsed_cycles,
+        gpu_active_cycles, gpu_capacity_cycles,
     )
     kvcache_hit_rate = metrics["kvcache_hit_rate"]
     line = (
@@ -155,6 +170,14 @@ def _print_instance_metrics(
             f"{metrics['decode_itr_counts_per_second']:.6f}"
         )
     line += " expert_inbalance=0.000000 pd_inbalance=0.000000"
+    if metrics["comm_overhead_pct"] is None:
+        line += " comm_overhead_pct=N/A"
+    else:
+        line += f" comm_overhead_pct={metrics['comm_overhead_pct']:.6f}"
+    if metrics["pipeline_bubble_fraction"] is None:
+        line += " pipeline_bubble_fraction=N/A"
+    else:
+        line += f" pipeline_bubble_fraction={metrics['pipeline_bubble_fraction']:.6f}"
     if metrics["per_tok_comm_bytes"] is None:
         line += " per_tok_comm_bytes=N/A"
     else:
@@ -635,6 +658,10 @@ def main():
     req_cnt = 0
     comm_wire_bytes = [0.0 for _ in range(num_instances)]
     comm_scheduled_tokens = [0 for _ in range(num_instances)]
+    comm_active_cycles = [0 for _ in range(num_instances)]
+    iteration_elapsed_cycles = [0 for _ in range(num_instances)]
+    gpu_active_cycles = [0 for _ in range(num_instances)]
+    gpu_capacity_cycles = [0 for _ in range(num_instances)]
     kv_pressure_score_peak = [0.0 for _ in range(num_instances)]
     input_tokens_total = [0 for _ in range(num_instances)]
     input_requests_total = [0 for _ in range(num_instances)]
@@ -692,7 +719,8 @@ def main():
     while True:
         
         out = controller.read_wait(p)
-        out_dict = controller.parse_output(out[-2])
+        out_dicts = controller.parse_outputs(out)
+        out_dict = out_dicts[-1] if out_dicts else None
         
         if out_dict != None:
             sys = out_dict['sys']
@@ -705,6 +733,16 @@ def main():
 
         instance_id = npu2inst_mapping[sys]  # get instance id from NPU id
         node_id = inst2node_mapping[instance_id] # get node id from instance id
+        for timing in out_dicts:
+            if timing["id"] <= 0 or timing["iteration_elapsed"] is None:
+                continue
+            timing_instance = npu2inst_mapping[timing["sys"]]
+            iteration_elapsed_cycles[timing_instance] += timing["iteration_elapsed"]
+            if timing["comm_active"] is not None:
+                comm_active_cycles[timing_instance] += timing["comm_active"]
+            if timing["gpu_active"] is not None:
+                gpu_active_cycles[timing_instance] += timing["gpu_active"]
+                gpu_capacity_cycles[timing_instance] += timing["iteration_elapsed"]
 
         # add stanby energy consumption for power modeling
         if power_modeling and sys == inst2npu_mapping[instance_id] and waiting_request[instance_id]:
@@ -1013,6 +1051,8 @@ def main():
                     comm_wire_bytes[inst_id], comm_scheduled_tokens[inst_id],
                     input_length_observed, output_length_observed,
                     prefill_rate, decode_rate,
+                    comm_active_cycles[inst_id], iteration_elapsed_cycles[inst_id],
+                    gpu_active_cycles[inst_id], gpu_capacity_cycles[inst_id],
                 )
 
             ######### Per Node Metrics #########
@@ -1145,6 +1185,8 @@ def main():
                         comm_wire_bytes[inst_idx], comm_scheduled_tokens[inst_idx],
                         input_length_observed, output_length_observed,
                         prefill_rate, decode_rate,
+                        comm_active_cycles[inst_idx], iteration_elapsed_cycles[inst_idx],
+                        gpu_active_cycles[inst_idx], gpu_capacity_cycles[inst_idx],
                     )
                     _print_instance_metric_summary(inst_idx, kv_pressure_score_peak[inst_idx])
                     schedulers[inst_idx].memory.free_prefix_cache()

@@ -256,6 +256,51 @@ the workload supplies the requested output length in advance, and the
 simulator does not currently model early EOS, cancellation, or
 sampling-dependent output lengths.
 
+`input_length_observed` is the average original prompt length of requests
+completed during the current reporting window. Prefix-cache hits do not reduce
+the observed length. In P/D mode, requests are counted only at terminal decode
+completion so they are not counted once by each pool.
+
+`prefill_iteration_counts_per_second` and
+`decode_itr_counts_per_second` count completed real scheduler batches over the
+simulated reporting-window duration. A mixed batch increments both counters.
+Chunked-prefill batches count once per completed chunk, while DP dummy batches
+are excluded. Decode detection uses the real `decode_k_list`, which is not
+modified by DP padding.
+
+`comm_overhead_pct` is a fraction in `[0, 1]`, despite the `_pct` suffix:
+
+```text
+sum(per-NPU communication-active cycles)
+/ sum(per-NPU workload elapsed cycles)
+```
+
+ASTRA-Sim measures union-active communication time for collectives and native
+sends/receives. Compute overlap is not added to the numerator, and memory/PIM
+operations are not classified as communication. This is communication
+occupancy, not the counterfactual latency reduction from making communication
+free.
+
+For PP configurations, `pipeline_bubble_fraction` is the cumulative modeled
+NPU-rank idle-capacity fraction:
+
+```text
+1 - sum(per-NPU compute-or-communication-active cycles)
+    / sum(per-NPU workload elapsed cycles)
+```
+
+ASTRA-Sim reports every managed PP rank, including middle stages. Compute and
+communication overlap is counted once through a union-active counter. The
+metric includes any rank idle time during a workload, so it can reflect
+fill/drain bubbles, stage imbalance, dependency stalls, or memory waits; it is
+not a causal attribution to fill/drain alone. `pp_size=1` reports `0`.
+
+The current supported system assumes `EP=1` and no P/D split. Consequently,
+`expert_inbalance` and `pd_inbalance` are temporary constants of `0`, meaning
+perfectly balanced/not applicable under those assumptions. They must be
+replaced with routing-count and per-pool-utilization calculations before EP or
+P/D configurations use these fields.
+
 ## Where to go next
 
 If you want to follow a single request from JSONL all the way to
