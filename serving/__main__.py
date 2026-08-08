@@ -237,6 +237,8 @@ def _write_metrics_sample(
 
 def _open_metrics_file(path):
     """Open an explicitly caller-owned JSONL destination without creating paths."""
+    if not os.path.isabs(path):
+        path = f"../{path}"
     parent = Path(path).parent
     if not parent.is_dir():
         raise ValueError(f"metrics output parent does not exist: {parent}")
