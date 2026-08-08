@@ -6,11 +6,13 @@ spawns the ASTRA-Sim subprocess, and runs the iteration loop:
 -> scheduler.add_done`` until every request completes.
 """
 
-import os
-import subprocess
 import argparse
+import atexit
 import json
+import os
 import shutil
+import subprocess
+from pathlib import Path
 from time import time
 from collections import defaultdict
 
@@ -66,6 +68,22 @@ def _runtime_limit(value):
     return float('inf') if value == 0 else value
 
 
+def _prefix_cache_hit_rate(requested, hits, previous_requested, previous_hits):
+    """Return the prefix-cache hit ratio for one reporting interval."""
+    requested_delta = requested - previous_requested
+    hits_delta = hits - previous_hits
+    if requested_delta <= 0 or hits_delta < 0:
+        return None
+    return hits_delta / requested_delta
+
+
+def _prefix_cache_counters(scheduler):
+    """Return cumulative NPU prefix-cache token counters for one scheduler."""
+    if not scheduler.enable_prefix_caching:
+        return 0, 0
+    return scheduler.memory.npu_prefix_cache.return_prefix_info()
+
+
 def _instance_metrics(
     scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0,
     input_length_observed=None, output_length_observed=None,
@@ -73,6 +91,7 @@ def _instance_metrics(
     decode_itr_counts_per_second=None,
     comm_active_cycles=0, iteration_elapsed_cycles=0,
     gpu_active_cycles=0, gpu_capacity_cycles=0,
+    kvcache_hit_rate=None,
 ):
     """Return per-instance gauges and modeled bytes per scheduled token.
 
@@ -81,11 +100,6 @@ def _instance_metrics(
     """
     memory = scheduler.memory
     kv_capacity = memory.npu_mem - memory.weight
-    kvcache_hit_rate = None
-    if scheduler.enable_prefix_caching:
-        requested, hit = memory.npu_prefix_cache.return_prefix_info()
-        if requested:
-            kvcache_hit_rate = hit / requested
     return {
         "gpu_mem_used_fraction": memory.npu_used / memory.npu_mem if memory.npu_mem else 0.0,
         "vram_headroom_gb": (memory.npu_mem - memory.npu_used) / GB_TO_BYTE,
@@ -101,8 +115,8 @@ def _instance_metrics(
         "output_length_observed": output_length_observed,
         "prefill_iteration_counts_per_second": prefill_iteration_counts_per_second,
         "decode_itr_counts_per_second": decode_itr_counts_per_second,
-        "expert_inbalance": 0.0,
-        "pd_inbalance": 0.0,
+        "expert_inbalance": None,
+        "pd_inbalance": None,
         "comm_overhead_pct": (
             comm_active_cycles / iteration_elapsed_cycles
             if iteration_elapsed_cycles else None
@@ -125,6 +139,7 @@ def _print_instance_metrics(
     decode_itr_counts_per_second=None,
     comm_active_cycles=0, iteration_elapsed_cycles=0,
     gpu_active_cycles=0, gpu_capacity_cycles=0,
+    kvcache_hit_rate=None,
 ):
     metrics = _instance_metrics(
         scheduler, current, comm_wire_bytes, scheduled_tokens,
@@ -132,6 +147,7 @@ def _print_instance_metrics(
         prefill_iteration_counts_per_second, decode_itr_counts_per_second,
         comm_active_cycles, iteration_elapsed_cycles,
         gpu_active_cycles, gpu_capacity_cycles,
+        kvcache_hit_rate,
     )
     kvcache_hit_rate = metrics["kvcache_hit_rate"]
     line = (
@@ -183,6 +199,34 @@ def _print_instance_metrics(
     else:
         line += f" per_tok_comm_bytes={metrics['per_tok_comm_bytes']:.6f}"
     print(line, flush=True)
+    return metrics
+
+
+def _write_metrics_sample(handle, sim_time_ns, sample_kind, instance_id, metrics):
+    """Append one machine-readable instance telemetry sample."""
+    handle.write(
+        json.dumps(
+            {
+                "sim_time_ns": int(sim_time_ns),
+                "sample_kind": sample_kind,
+                "instance_id": int(instance_id),
+                **metrics,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    handle.flush()
+
+
+def _open_metrics_file(path):
+    """Open an explicitly caller-owned JSONL destination without creating paths."""
+    parent = Path(path).parent
+    if not parent.is_dir():
+        raise ValueError(f"metrics output parent does not exist: {parent}")
+    handle = open(path, "w", encoding="utf-8")
+    atexit.register(handle.close)
+    return handle
 
 
 def _print_instance_metric_summary(instance_id, kv_pressure_score_peak):
@@ -408,6 +452,10 @@ def main():
     parser.add_argument('--output', type=str, default=None,
                         help='path for per-request CSV output with latency metrics (TTFT, TPOT, ITL). '
                         'If None, results are printed to stdout only. Supports {run_id} placeholder')
+    parser.add_argument('--metrics-output', type=str, default=None,
+                        help='internal cluster-simulator JSONL telemetry path. Supports {run_id} placeholder')
+    parser.add_argument('--metrics-interval-seconds', type=float, default=10.0,
+                        help='simulated seconds between JSONL telemetry samples (default: 10)')
     parser.add_argument('--run-id', type=str, default=None,
                         help='unique id for this simulation run. Intermediate ASTRA-Sim inputs are written under '
                         'astra-sim/inputs/runs/<run-id>. If omitted, a process-unique id is generated')
@@ -439,6 +487,9 @@ def main():
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+    args.metrics_output = _resolve_output_file(args.metrics_output, args.run_id)
+    if args.metrics_interval_seconds <= 0:
+        parser.error('--metrics-interval-seconds must be positive')
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -454,6 +505,8 @@ def main():
     prefix_storage=args.prefix_storage
     dataset=args.dataset
     output_file=args.output
+    metrics_output_file=args.metrics_output
+    metrics_file = _open_metrics_file(metrics_output_file) if metrics_output_file else None
     is_init = not args.skip_prefill
     num_req=args.num_reqs
     log_interval=args.log_interval
@@ -656,6 +709,8 @@ def main():
     total_gen = 0
     total_latency = 0
     req_cnt = 0
+    last_metrics_sample = 0
+    METRICS_INTERVAL = args.metrics_interval_seconds * FREQ
     comm_wire_bytes = [0.0 for _ in range(num_instances)]
     comm_scheduled_tokens = [0 for _ in range(num_instances)]
     comm_active_cycles = [0 for _ in range(num_instances)]
@@ -673,6 +728,8 @@ def main():
     output_requests_last_log = [0 for _ in range(num_instances)]
     prefill_iterations_last_log = [0 for _ in range(num_instances)]
     decode_iterations_last_log = [0 for _ in range(num_instances)]
+    prefix_requested_last_log = [0 for _ in range(num_instances)]
+    prefix_hits_last_log = [0 for _ in range(num_instances)]
     metrics_last_time = [0 for _ in range(num_instances)]
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
@@ -999,6 +1056,12 @@ def main():
             )
             prompt_th = 0
             gen_th = 0
+            write_metrics_sample = (
+                metrics_file is not None
+                and current >= last_metrics_sample + METRICS_INTERVAL
+            )
+            if write_metrics_sample:
+                last_metrics_sample = current
 
             ######### Per Instance Metrics #########
 
@@ -1039,21 +1102,35 @@ def main():
                 )
                 prefill_rate = prefill_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
                 decode_rate = decode_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
+                prefix_requested, prefix_hits = _prefix_cache_counters(schedulers[inst_id])
+                prefix_hit_rate = _prefix_cache_hit_rate(
+                    prefix_requested,
+                    prefix_hits,
+                    prefix_requested_last_log[inst_id],
+                    prefix_hits_last_log[inst_id],
+                )
                 input_tokens_last_log[inst_id] = input_tokens_total[inst_id]
                 input_requests_last_log[inst_id] = input_requests_total[inst_id]
                 output_tokens_last_log[inst_id] = output_tokens_total[inst_id]
                 output_requests_last_log[inst_id] = output_requests_total[inst_id]
                 prefill_iterations_last_log[inst_id] = schedulers[inst_id].prefill_iterations
                 decode_iterations_last_log[inst_id] = schedulers[inst_id].decode_iterations
+                prefix_requested_last_log[inst_id] = prefix_requested
+                prefix_hits_last_log[inst_id] = prefix_hits
                 metrics_last_time[inst_id] = current
-                _print_instance_metrics(
+                metrics = _print_instance_metrics(
                     inst_id, schedulers[inst_id], current,
                     comm_wire_bytes[inst_id], comm_scheduled_tokens[inst_id],
                     input_length_observed, output_length_observed,
                     prefill_rate, decode_rate,
                     comm_active_cycles[inst_id], iteration_elapsed_cycles[inst_id],
                     gpu_active_cycles[inst_id], gpu_capacity_cycles[inst_id],
+                    prefix_hit_rate,
                 )
+                if write_metrics_sample:
+                    _write_metrics_sample(
+                        metrics_file, current, "periodic", inst_id, metrics
+                    )
 
             ######### Per Node Metrics #########
             if node2inst_mapping:
@@ -1180,14 +1257,30 @@ def main():
                     )
                     prefill_rate = prefill_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
                     decode_rate = decode_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
-                    _print_instance_metrics(
+                    prefix_requested, prefix_hits = _prefix_cache_counters(schedulers[inst_idx])
+                    prefix_hit_rate = _prefix_cache_hit_rate(
+                        prefix_requested,
+                        prefix_hits,
+                        prefix_requested_last_log[inst_idx],
+                        prefix_hits_last_log[inst_idx],
+                    )
+                    metrics = _print_instance_metrics(
                         inst_idx, schedulers[inst_idx], current,
                         comm_wire_bytes[inst_idx], comm_scheduled_tokens[inst_idx],
                         input_length_observed, output_length_observed,
                         prefill_rate, decode_rate,
                         comm_active_cycles[inst_idx], iteration_elapsed_cycles[inst_idx],
                         gpu_active_cycles[inst_idx], gpu_capacity_cycles[inst_idx],
+                        prefix_hit_rate,
                     )
+                    if metrics_file is not None:
+                        _write_metrics_sample(
+                            metrics_file,
+                            current,
+                            "final",
+                            inst_idx,
+                            metrics,
+                        )
                     _print_instance_metric_summary(inst_idx, kv_pressure_score_peak[inst_idx])
                     schedulers[inst_idx].memory.free_prefix_cache()
                     schedulers[inst_idx].memory.free_weight()
@@ -1197,6 +1290,8 @@ def main():
 
                 print_rule()
                 print_markup("[sim.heading]▶ Exiting simulation...[/]\n")
+                if metrics_file is not None:
+                    metrics_file.close()
                 controller.write_flush(p, "exit")
                 break
             controller.write_flush(p, "done") # make done instances to sleep
