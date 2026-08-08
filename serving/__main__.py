@@ -79,6 +79,26 @@ def _iteration_rate(current_count, previous_count, elapsed_ns):
     return delta * NANOSECONDS_PER_SECOND / elapsed_ns
 
 
+def _interval_ratio(current_total, previous_total, current_denominator, previous_denominator):
+    """Return a ratio over one interval from monotonic numerator and denominator totals."""
+    numerator = current_total - previous_total
+    denominator = current_denominator - previous_denominator
+    if numerator < 0 or denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _interval_pipeline_bubble(pp_size, current_active, previous_active, current_capacity, previous_capacity):
+    """Return the pipeline bubble fraction over one explicit sample interval."""
+    if pp_size <= 1:
+        return 0.0
+    active = current_active - previous_active
+    capacity = current_capacity - previous_capacity
+    if active < 0 or capacity <= 0:
+        return None
+    return max(0.0, min(1.0, 1.0 - active / capacity))
+
+
 def _instance_metrics(
     scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0,
     input_length_observed=None, output_length_observed=None,
@@ -728,6 +748,12 @@ def main():
     prefill_iterations_last_sample = [0 for _ in range(num_instances)]
     decode_iterations_last_sample = [0 for _ in range(num_instances)]
     metrics_last_sample_time = [0 for _ in range(num_instances)]
+    comm_wire_bytes_last_sample = [0.0 for _ in range(num_instances)]
+    comm_scheduled_tokens_last_sample = [0 for _ in range(num_instances)]
+    comm_active_cycles_last_sample = [0 for _ in range(num_instances)]
+    iteration_elapsed_cycles_last_sample = [0 for _ in range(num_instances)]
+    gpu_active_cycles_last_sample = [0 for _ in range(num_instances)]
+    gpu_capacity_cycles_last_sample = [0 for _ in range(num_instances)]
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = router.get_first_arrival_time()
@@ -1128,6 +1154,25 @@ def main():
                             decode_iterations_last_sample[inst_id],
                             sample_interval_ns,
                         ),
+                        "comm_overhead_pct": _interval_ratio(
+                            comm_active_cycles[inst_id],
+                            comm_active_cycles_last_sample[inst_id],
+                            iteration_elapsed_cycles[inst_id],
+                            iteration_elapsed_cycles_last_sample[inst_id],
+                        ),
+                        "per_tok_comm_bytes": _interval_ratio(
+                            comm_wire_bytes[inst_id],
+                            comm_wire_bytes_last_sample[inst_id],
+                            comm_scheduled_tokens[inst_id],
+                            comm_scheduled_tokens_last_sample[inst_id],
+                        ),
+                        "pipeline_bubble_fraction": _interval_pipeline_bubble(
+                            schedulers[inst_id].pp_size,
+                            gpu_active_cycles[inst_id],
+                            gpu_active_cycles_last_sample[inst_id],
+                            gpu_capacity_cycles[inst_id],
+                            gpu_capacity_cycles_last_sample[inst_id],
+                        ),
                     }
                     _write_metrics_sample(
                         metrics_file,
@@ -1140,6 +1185,12 @@ def main():
                     prefill_iterations_last_sample[inst_id] = schedulers[inst_id].prefill_iterations
                     decode_iterations_last_sample[inst_id] = schedulers[inst_id].decode_iterations
                     metrics_last_sample_time[inst_id] = current
+                    comm_wire_bytes_last_sample[inst_id] = comm_wire_bytes[inst_id]
+                    comm_scheduled_tokens_last_sample[inst_id] = comm_scheduled_tokens[inst_id]
+                    comm_active_cycles_last_sample[inst_id] = comm_active_cycles[inst_id]
+                    iteration_elapsed_cycles_last_sample[inst_id] = iteration_elapsed_cycles[inst_id]
+                    gpu_active_cycles_last_sample[inst_id] = gpu_active_cycles[inst_id]
+                    gpu_capacity_cycles_last_sample[inst_id] = gpu_capacity_cycles[inst_id]
 
             ######### Per Node Metrics #########
             if node2inst_mapping:

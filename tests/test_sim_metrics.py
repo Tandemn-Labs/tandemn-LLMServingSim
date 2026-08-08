@@ -13,6 +13,8 @@ sys.modules.setdefault("pyinstrument", SimpleNamespace(Profiler=object))
 from serving.__main__ import (
     _instance_metrics,
     _iteration_rate,
+    _interval_pipeline_bubble,
+    _interval_ratio,
     _open_metrics_file,
     _print_instance_metrics,
     _write_metrics_sample,
@@ -133,6 +135,16 @@ class SimMetricsTest(unittest.TestCase):
         self.assertEqual(_iteration_rate(20, 5, 10_000_000_000), 1.5)
         self.assertIsNone(_iteration_rate(5, 5, 0))
         self.assertIsNone(_iteration_rate(5, 6, 10_000_000_000))
+
+    def test_interval_ratio_uses_delta_totals(self):
+        self.assertEqual(_interval_ratio(150, 50, 40, 10), 10 / 3)
+        self.assertIsNone(_interval_ratio(40, 50, 30, 10))
+        self.assertIsNone(_interval_ratio(50, 40, 10, 10))
+
+    def test_interval_pipeline_bubble_uses_delta_cycles(self):
+        self.assertEqual(_interval_pipeline_bubble(1, 0, 0, 0, 0), 0.0)
+        self.assertEqual(_interval_pipeline_bubble(2, 180, 80, 250, 50), 0.5)
+        self.assertIsNone(_interval_pipeline_bubble(2, 80, 90, 200, 100))
 
     def test_metrics_output_requires_existing_parent(self):
         with tempfile.TemporaryDirectory() as directory:
