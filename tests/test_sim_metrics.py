@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import sys
@@ -12,12 +13,12 @@ sys.modules.setdefault("pyinstrument", SimpleNamespace(Profiler=object))
 from serving.__main__ import (
     _instance_metrics,
     _open_metrics_file,
-    _prefix_cache_hit_rate,
     _print_instance_metrics,
     _write_metrics_sample,
 )
 from serving.core.controller import Controller
 from serving.core.memory_model import MemoryModel
+from serving.core.request import Request
 from serving.core.scheduler import Scheduler
 from serving.core.trace_generator import _trace_collective_wire_bytes
 
@@ -141,10 +142,55 @@ class SimMetricsTest(unittest.TestCase):
 
             self.assertTrue(path.is_file())
 
-    def test_prefix_cache_hit_rate_uses_interval_deltas(self):
-        self.assertEqual(_prefix_cache_hit_rate(300, 120, 100, 20), 0.5)
-        self.assertIsNone(_prefix_cache_hit_rate(300, 120, 300, 120))
-        self.assertIsNone(_prefix_cache_hit_rate(300, 20, 100, 30))
+    def test_prefix_match_freezes_request_level_npu_hit_facts(self):
+        request = Request(
+            1,
+            "model",
+            100,
+            120,
+            0,
+            0,
+            input_hash_ids=list(range(100)),
+        )
+        memory = MemoryModel.__new__(MemoryModel)
+        memory.enable_prefix_caching = True
+        memory.npu_prefix_cache = SimpleNamespace(
+            match_prefix=lambda _: SimpleNamespace(hit_length=64, last_device_node=None)
+        )
+        memory.prefix_storage = None
+
+        memory.prefix_match(request)
+        memory.npu_prefix_cache = SimpleNamespace(
+            match_prefix=lambda _: SimpleNamespace(hit_length=0, last_device_node=None)
+        )
+        memory.prefix_match(request)
+
+        self.assertEqual(request.npu_prefix_hit_tokens, 64)
+        self.assertEqual(request.prefix_cache_requested_tokens, 100)
+        self.assertEqual(request.prefix_cache_hit_ratio, 0.64)
+
+    def test_request_csv_includes_prefix_cache_facts(self):
+        request = Request(1, "model", 100, 120, 0, 0)
+        request.end_time = 1_000
+        request.latency = 1_000
+        request.queuing_delay = 0
+        request.ttft = 100
+        request.tpot = 10
+        request.npu_prefix_hit_tokens = 64
+        request.prefix_cache_requested_tokens = 100
+        request.prefix_cache_hit_ratio = 0.64
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.done = [request]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.csv"
+            scheduler.save_output(str(path))
+            with path.open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+
+        self.assertEqual(row["npu_prefix_hit_tokens"], "64")
+        self.assertEqual(row["prefix_cache_requested_tokens"], "100")
+        self.assertEqual(row["prefix_cache_hit_ratio"], "0.64")
 
     def test_unimplemented_imbalance_is_null_in_metrics_not_stdout(self):
         scheduler = SimpleNamespace(
@@ -156,11 +202,12 @@ class SimMetricsTest(unittest.TestCase):
             get_kv_pressure_score=lambda: 0.0,
         )
         with redirect_stdout(io.StringIO()) as output:
-            metrics = _print_instance_metrics(0, scheduler, 0, kvcache_hit_rate=0.5)
+            metrics = _print_instance_metrics(0, scheduler, 0)
 
         self.assertIsNone(metrics["expert_inbalance"])
         self.assertIsNone(metrics["pd_inbalance"])
-        self.assertEqual(metrics["kvcache_hit_rate"], 0.5)
+        self.assertNotIn("kvcache_hit_rate", metrics)
+        self.assertNotIn("kvcache_hit_rate", output.getvalue())
         self.assertIn("expert_inbalance=0.000000 pd_inbalance=0.000000", output.getvalue())
 
 

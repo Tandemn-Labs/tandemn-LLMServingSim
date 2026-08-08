@@ -68,22 +68,6 @@ def _runtime_limit(value):
     return float('inf') if value == 0 else value
 
 
-def _prefix_cache_hit_rate(requested, hits, previous_requested, previous_hits):
-    """Return the prefix-cache hit ratio for one reporting interval."""
-    requested_delta = requested - previous_requested
-    hits_delta = hits - previous_hits
-    if requested_delta <= 0 or hits_delta < 0:
-        return None
-    return hits_delta / requested_delta
-
-
-def _prefix_cache_counters(scheduler):
-    """Return cumulative NPU prefix-cache token counters for one scheduler."""
-    if not scheduler.enable_prefix_caching:
-        return 0, 0
-    return scheduler.memory.npu_prefix_cache.return_prefix_info()
-
-
 def _instance_metrics(
     scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0,
     input_length_observed=None, output_length_observed=None,
@@ -91,7 +75,6 @@ def _instance_metrics(
     decode_itr_counts_per_second=None,
     comm_active_cycles=0, iteration_elapsed_cycles=0,
     gpu_active_cycles=0, gpu_capacity_cycles=0,
-    kvcache_hit_rate=None,
 ):
     """Return per-instance gauges and modeled bytes per scheduled token.
 
@@ -109,7 +92,6 @@ def _instance_metrics(
         ),
         "live_batch_size": sum(len(batch.requests) for batch in scheduler.inflight),
         "depth_req_q": sum(req.arrival <= current for req in scheduler.request),
-        "kvcache_hit_rate": kvcache_hit_rate,
         "kv_pressure_score": scheduler.get_kv_pressure_score(),
         "input_length_observed": input_length_observed,
         "output_length_observed": output_length_observed,
@@ -139,7 +121,6 @@ def _print_instance_metrics(
     decode_itr_counts_per_second=None,
     comm_active_cycles=0, iteration_elapsed_cycles=0,
     gpu_active_cycles=0, gpu_capacity_cycles=0,
-    kvcache_hit_rate=None,
 ):
     metrics = _instance_metrics(
         scheduler, current, comm_wire_bytes, scheduled_tokens,
@@ -147,9 +128,7 @@ def _print_instance_metrics(
         prefill_iteration_counts_per_second, decode_itr_counts_per_second,
         comm_active_cycles, iteration_elapsed_cycles,
         gpu_active_cycles, gpu_capacity_cycles,
-        kvcache_hit_rate,
     )
-    kvcache_hit_rate = metrics["kvcache_hit_rate"]
     line = (
         f"SIM_METRICS instance={instance_id} "
         f"gpu_mem_used_fraction={metrics['gpu_mem_used_fraction']:.6f} "
@@ -159,10 +138,6 @@ def _print_instance_metrics(
         f"depth_req_q={metrics['depth_req_q']} "
         f"kv_pressure_score={metrics['kv_pressure_score']:.6f}"
     )
-    if kvcache_hit_rate is None:
-        line += " kvcache_hit_rate=N/A"
-    else:
-        line += f" kvcache_hit_rate={kvcache_hit_rate:.6f}"
     if metrics["input_length_observed"] is None:
         line += " input_length_observed=N/A"
     else:
@@ -728,8 +703,6 @@ def main():
     output_requests_last_log = [0 for _ in range(num_instances)]
     prefill_iterations_last_log = [0 for _ in range(num_instances)]
     decode_iterations_last_log = [0 for _ in range(num_instances)]
-    prefix_requested_last_log = [0 for _ in range(num_instances)]
-    prefix_hits_last_log = [0 for _ in range(num_instances)]
     metrics_last_time = [0 for _ in range(num_instances)]
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
@@ -1102,21 +1075,12 @@ def main():
                 )
                 prefill_rate = prefill_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
                 decode_rate = decode_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
-                prefix_requested, prefix_hits = _prefix_cache_counters(schedulers[inst_id])
-                prefix_hit_rate = _prefix_cache_hit_rate(
-                    prefix_requested,
-                    prefix_hits,
-                    prefix_requested_last_log[inst_id],
-                    prefix_hits_last_log[inst_id],
-                )
                 input_tokens_last_log[inst_id] = input_tokens_total[inst_id]
                 input_requests_last_log[inst_id] = input_requests_total[inst_id]
                 output_tokens_last_log[inst_id] = output_tokens_total[inst_id]
                 output_requests_last_log[inst_id] = output_requests_total[inst_id]
                 prefill_iterations_last_log[inst_id] = schedulers[inst_id].prefill_iterations
                 decode_iterations_last_log[inst_id] = schedulers[inst_id].decode_iterations
-                prefix_requested_last_log[inst_id] = prefix_requested
-                prefix_hits_last_log[inst_id] = prefix_hits
                 metrics_last_time[inst_id] = current
                 metrics = _print_instance_metrics(
                     inst_id, schedulers[inst_id], current,
@@ -1125,7 +1089,6 @@ def main():
                     prefill_rate, decode_rate,
                     comm_active_cycles[inst_id], iteration_elapsed_cycles[inst_id],
                     gpu_active_cycles[inst_id], gpu_capacity_cycles[inst_id],
-                    prefix_hit_rate,
                 )
                 if write_metrics_sample:
                     _write_metrics_sample(
@@ -1257,13 +1220,6 @@ def main():
                     )
                     prefill_rate = prefill_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
                     decode_rate = decode_iterations * FREQ / elapsed_ns if elapsed_ns > 0 else None
-                    prefix_requested, prefix_hits = _prefix_cache_counters(schedulers[inst_idx])
-                    prefix_hit_rate = _prefix_cache_hit_rate(
-                        prefix_requested,
-                        prefix_hits,
-                        prefix_requested_last_log[inst_idx],
-                        prefix_hits_last_log[inst_idx],
-                    )
                     metrics = _print_instance_metrics(
                         inst_idx, schedulers[inst_idx], current,
                         comm_wire_bytes[inst_idx], comm_scheduled_tokens[inst_idx],
@@ -1271,7 +1227,6 @@ def main():
                         prefill_rate, decode_rate,
                         comm_active_cycles[inst_idx], iteration_elapsed_cycles[inst_idx],
                         gpu_active_cycles[inst_idx], gpu_capacity_cycles[inst_idx],
-                        prefix_hit_rate,
                     )
                     if metrics_file is not None:
                         _write_metrics_sample(

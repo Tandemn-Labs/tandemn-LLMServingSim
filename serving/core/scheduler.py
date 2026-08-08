@@ -1071,8 +1071,10 @@ class Scheduler:
             # Write the column headers
             if not is_append:
                 writer.writerow(['instance id', 'request id', 'model', 'input', 'output',
-                                'arrival', 'end_time', 'latency', 
-                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
+                                 'arrival', 'end_time', 'latency',
+                                 'queuing_delay', 'TTFT', 'TPOT', 'ITL',
+                                 'npu_prefix_hit_tokens', 'prefix_cache_requested_tokens',
+                                 'prefix_cache_hit_ratio'])
             
             # Write each request's information
             for req in self.done:
@@ -1088,7 +1090,10 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.itl
+                    req.itl,
+                    req.npu_prefix_hit_tokens,
+                    req.prefix_cache_requested_tokens,
+                    req.prefix_cache_hit_ratio,
                 ])
 
 

@@ -748,6 +748,13 @@ class MemoryModel():
             req.storage_last_node = None
         
         req.prefix_cache_hit = max(req.npu_cache_hit, req.storage_cache_hit)
+        if not req._prefix_cache_match_recorded:
+            req.npu_prefix_hit_tokens = req.npu_cache_hit
+            req.prefix_cache_requested_tokens = req.original_input
+            req.prefix_cache_hit_ratio = (
+                req.npu_cache_hit / req.original_input if req.original_input else 0.0
+            )
+            req._prefix_cache_match_recorded = True
         # if req.num_computed_tokens < req.prefix_cache_hit:
         #     req.num_computed_tokens = req.prefix_cache_hit
         if req.num_computed_tokens == 0:
