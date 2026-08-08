@@ -12,6 +12,7 @@ from scripts.smoke_test import read_sim_metric_summary, read_sim_metrics
 sys.modules.setdefault("pyinstrument", SimpleNamespace(Profiler=object))
 from serving.__main__ import (
     _instance_metrics,
+    _iteration_rate,
     _open_metrics_file,
     _print_instance_metrics,
     _write_metrics_sample,
@@ -108,6 +109,7 @@ class SimMetricsTest(unittest.TestCase):
                     "periodic",
                     2,
                     {"kv_cache_util": 0.5, "expert_inbalance": None},
+                    10_000_000_000,
                 )
                 _write_metrics_sample(
                     handle,
@@ -121,10 +123,16 @@ class SimMetricsTest(unittest.TestCase):
         self.assertEqual(periodic["sim_time_ns"], 10_000_000_000)
         self.assertEqual(periodic["sample_kind"], "periodic")
         self.assertEqual(periodic["instance_id"], 2)
+        self.assertEqual(periodic["sample_interval_ns"], 10_000_000_000)
         self.assertIsNone(periodic["expert_inbalance"])
         self.assertEqual(final["sample_kind"], "final")
         self.assertEqual(final["kv_cache_util"], 0.75)
         self.assertNotIn("kv_pressure_score_peak", final)
+
+    def test_iteration_rate_uses_explicit_sample_interval(self):
+        self.assertEqual(_iteration_rate(20, 5, 10_000_000_000), 1.5)
+        self.assertIsNone(_iteration_rate(5, 5, 0))
+        self.assertIsNone(_iteration_rate(5, 6, 10_000_000_000))
 
     def test_metrics_output_requires_existing_parent(self):
         with tempfile.TemporaryDirectory() as directory:

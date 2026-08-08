@@ -34,6 +34,9 @@ import sys as flush
 from pyinstrument import Profiler
 
 
+NANOSECONDS_PER_SECOND = 1_000_000_000
+
+
 def _pad_batch_to_max(batch, max_len):
     """Pad a batch up to ``max_len`` for DP-sync.
 
@@ -66,6 +69,14 @@ def _pad_batch_to_max(batch, max_len):
 
 def _runtime_limit(value):
     return float('inf') if value == 0 else value
+
+
+def _iteration_rate(current_count, previous_count, elapsed_ns):
+    """Return one simulator iteration rate over an explicit sample interval."""
+    delta = current_count - previous_count
+    if elapsed_ns <= 0 or delta < 0:
+        return None
+    return delta * NANOSECONDS_PER_SECOND / elapsed_ns
 
 
 def _instance_metrics(
@@ -177,16 +188,26 @@ def _print_instance_metrics(
     return metrics
 
 
-def _write_metrics_sample(handle, sim_time_ns, sample_kind, instance_id, metrics):
+def _write_metrics_sample(
+    handle,
+    sim_time_ns,
+    sample_kind,
+    instance_id,
+    metrics,
+    sample_interval_ns=None,
+):
     """Append one machine-readable instance telemetry sample."""
+    sample = {
+        "sim_time_ns": int(sim_time_ns),
+        "sample_kind": sample_kind,
+        "instance_id": int(instance_id),
+        **metrics,
+    }
+    if sample_interval_ns is not None:
+        sample["sample_interval_ns"] = int(sample_interval_ns)
     handle.write(
         json.dumps(
-            {
-                "sim_time_ns": int(sim_time_ns),
-                "sample_kind": sample_kind,
-                "instance_id": int(instance_id),
-                **metrics,
-            },
+            sample,
             separators=(",", ":"),
         )
         + "\n"
@@ -704,6 +725,9 @@ def main():
     prefill_iterations_last_log = [0 for _ in range(num_instances)]
     decode_iterations_last_log = [0 for _ in range(num_instances)]
     metrics_last_time = [0 for _ in range(num_instances)]
+    prefill_iterations_last_sample = [0 for _ in range(num_instances)]
+    decode_iterations_last_sample = [0 for _ in range(num_instances)]
+    metrics_last_sample_time = [0 for _ in range(num_instances)]
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = router.get_first_arrival_time()
@@ -1091,9 +1115,31 @@ def main():
                     gpu_active_cycles[inst_id], gpu_capacity_cycles[inst_id],
                 )
                 if write_metrics_sample:
+                    sample_interval_ns = current - metrics_last_sample_time[inst_id]
+                    sample_metrics = {
+                        **metrics,
+                        "prefill_iteration_counts_per_second": _iteration_rate(
+                            schedulers[inst_id].prefill_iterations,
+                            prefill_iterations_last_sample[inst_id],
+                            sample_interval_ns,
+                        ),
+                        "decode_itr_counts_per_second": _iteration_rate(
+                            schedulers[inst_id].decode_iterations,
+                            decode_iterations_last_sample[inst_id],
+                            sample_interval_ns,
+                        ),
+                    }
                     _write_metrics_sample(
-                        metrics_file, current, "periodic", inst_id, metrics
+                        metrics_file,
+                        current,
+                        "periodic",
+                        inst_id,
+                        sample_metrics,
+                        sample_interval_ns,
                     )
+                    prefill_iterations_last_sample[inst_id] = schedulers[inst_id].prefill_iterations
+                    decode_iterations_last_sample[inst_id] = schedulers[inst_id].decode_iterations
+                    metrics_last_sample_time[inst_id] = current
 
             ######### Per Node Metrics #########
             if node2inst_mapping:
