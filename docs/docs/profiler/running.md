@@ -89,6 +89,23 @@ kv_decode)`. Three knobs control its shape:
 Smaller factors densify the axis (more shots, slower); larger factors
 coarsen it (fewer shots, faster).
 
+## Attention backend
+
+By default, vLLM selects an attention backend for the active hardware. Override
+that choice only when the same backend will be used by the real vLLM deployment
+used for validation:
+
+```bash
+ATTENTION_BACKEND="TRITON_ATTN"
+./profiler/profile.sh
+```
+
+The direct CLI equivalent is `--attention-backend TRITON_ATTN`. Backend choice
+changes attention latency and is recorded in `meta.yaml::engine_effective`.
+It is not part of the auto-derived variant name, so use a distinct hardware
+label such as `MI300X-ROCm7.13-TRITON-RUNPOD` rather than mixing profiles from
+different attention backends under one hardware directory.
+
 ## Measurement averaging
 
 ```bash
