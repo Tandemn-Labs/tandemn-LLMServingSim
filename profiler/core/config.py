@@ -388,7 +388,7 @@ class ProfileArgs:
             directory. If omitted at the CLI, auto-derived from
             ``dtype`` + ``kv_cache_dtype`` so that profiles with
             different engine kwargs don't collide.
-        dtype / kv_cache_dtype / max_num_batched_tokens / max_num_seqs:
+        dtype / kv_cache_dtype / attention_backend / max_num_batched_tokens / max_num_seqs:
             Common vLLM engine kwargs. None means "use defaults"
             (HOST_ENGINE_DEFAULTS for max_*, vLLM default for dtype).
         attention_max_kv: Cap for attention grid's KV axes. Doubles
@@ -411,6 +411,7 @@ class ProfileArgs:
     # Engine kwargs (optional overrides)
     dtype: str | None = None
     kv_cache_dtype: str | None = None
+    attention_backend: str | None = None
     max_num_batched_tokens: int | None = None
     max_num_seqs: int | None = None
     hf_overrides: dict[str, Any] | None = None
