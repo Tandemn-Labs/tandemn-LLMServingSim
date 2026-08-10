@@ -62,7 +62,6 @@ class Workload : public Callable {
 
     bool is_sleep;
     std::queue<std::string> pending_workloads;
-    std::vector<Sys*> managed_systems;
     uint64_t iteration_start_tick;
     uint64_t iteration_start_compute_ticks;
     uint64_t iteration_start_comm_ticks;

@@ -295,6 +295,10 @@ metric includes any rank idle time during a workload, so it can reflect
 fill/drain bubbles, stage imbalance, dependency stalls, or memory waits; it is
 not a causal attribution to fill/drain alone. `pp_size=1` reports `0`.
 
+Each rank emits its timing when its own iteration completes. The simulator
+aggregates an instance metric only after it has one report from every rank for
+that instance and iteration.
+
 The current supported system assumes `EP=1` and no P/D split. Consequently,
 `expert_inbalance` and `pd_inbalance` are temporary constants of `0`, meaning
 perfectly balanced/not applicable under those assumptions. They must be

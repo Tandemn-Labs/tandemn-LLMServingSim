@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from scripts.smoke_test import read_sim_metric_summary, read_sim_metrics
 sys.modules.setdefault("pyinstrument", SimpleNamespace(Profiler=object))
 from serving.__main__ import (
+    _collect_completed_iteration,
     _instance_metrics,
     _iteration_rate,
     _interval_pipeline_bubble,
@@ -78,12 +79,48 @@ class SimMetricsTest(unittest.TestCase):
             "sys[0] iteration 2 finished, 100 cycles, exposed communication 20 cycles. "
             "iteration elapsed 40 cycles, active compute 30 cycles, "
             "active communication 8 cycles, active GPU 35 cycles.\n",
-            "Waiting\n",
+            "Waiting sys[0] cycle 100\n",
         ])
 
         self.assertEqual([report["sys"] for report in reports], [1, 0])
         self.assertEqual(sum(report["comm_active"] for report in reports), 20)
         self.assertEqual(sum(report["gpu_active"] for report in reports), 66)
+        self.assertEqual(controller.parse_waiting([
+            "sys[1] iteration 2 finished, 100 cycles, exposed communication 30 cycles.\n",
+            "Waiting sys[0] cycle 100\n",
+        ]), (0, 100))
+
+    def test_rank_reports_wait_for_the_full_instance_iteration(self):
+        pending = {}
+        ranks_by_instance = [{0, 1, 2}]
+        npu2inst_mapping = {0: 0, 1: 0, 2: 0}
+
+        def report(sys_id, comm_active):
+            return {
+                "sys": sys_id,
+                "id": 1,
+                "iteration_elapsed": 100,
+                "comm_active": comm_active,
+                "gpu_active": 80,
+            }
+
+        self.assertIsNone(_collect_completed_iteration(
+            pending, ranks_by_instance, npu2inst_mapping, report(2, 30)
+        ))
+        self.assertIsNone(_collect_completed_iteration(
+            pending, ranks_by_instance, npu2inst_mapping, report(0, 10)
+        ))
+        self.assertIsNone(_collect_completed_iteration(
+            pending, ranks_by_instance, npu2inst_mapping, report(0, 99)
+        ))
+
+        instance_id, reports = _collect_completed_iteration(
+            pending, ranks_by_instance, npu2inst_mapping, report(1, 20)
+        )
+        self.assertEqual(instance_id, 0)
+        self.assertEqual(set(reports), {0, 1, 2})
+        self.assertEqual(reports[0]["comm_active"], 10)
+        self.assertEqual(pending, {})
 
     def test_smoke_parser_merges_live_and_summary_metrics(self):
         with tempfile.TemporaryDirectory() as directory:

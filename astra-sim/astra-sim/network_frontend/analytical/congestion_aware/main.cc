@@ -231,8 +231,8 @@ int main(int argc, char* argv[]) {
         cout << "Checking End NPU " << npu_id << " ..." << endl;
         // Only proceed if the workload has finished its iteration
         if (!systems[npu_id]->workload->is_sleep && systems[npu_id]->workload->is_finished) {
-          systems[npu_id]->workload->report();
-          AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
+          AstraSim::LoggerFactory::get_logger("workload")
+              ->info("Waiting sys[{}] cycle {}", npu_id, Sys::boostedTick());
 
           std::string new_filename;
           std::getline(std::cin, new_filename);
@@ -267,8 +267,8 @@ int main(int argc, char* argv[]) {
         // Only proceed if the workload has finished its iteration
         cout << "Checking Managed Systems for Controller NPU " << npu_id << " ..." << endl;
         if (!systems[npu_id]->workload->is_sleep && systems[npu_id]->workload->is_finished) {
-          systems[npu_id]->workload->report();
-          AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
+          AstraSim::LoggerFactory::get_logger("workload")
+              ->info("Waiting sys[{}] cycle {}", npu_id, Sys::boostedTick());
 
           std::string new_filename;
           std::getline(std::cin, new_filename);

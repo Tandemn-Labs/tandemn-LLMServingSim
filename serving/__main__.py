@@ -99,6 +99,20 @@ def _interval_pipeline_bubble(pp_size, current_active, previous_active, current_
     return max(0.0, min(1.0, 1.0 - active / capacity))
 
 
+def _collect_completed_iteration(pending_reports, ranks_by_instance, npu2inst_mapping, timing):
+    """Buffer one rank report until its instance iteration is complete."""
+    if timing["id"] <= 0 or timing["iteration_elapsed"] is None:
+        return None
+
+    instance_id = npu2inst_mapping[timing["sys"]]
+    key = instance_id, timing["id"]
+    reports = pending_reports.setdefault(key, {})
+    reports.setdefault(timing["sys"], timing)
+    if set(reports) != ranks_by_instance[instance_id]:
+        return None
+    return instance_id, pending_reports.pop(key)
+
+
 def _instance_metrics(
     scheduler, current, comm_wire_bytes=0.0, scheduled_tokens=0,
     input_length_observed=None, output_length_observed=None,
@@ -735,6 +749,11 @@ def main():
     iteration_elapsed_cycles = [0 for _ in range(num_instances)]
     gpu_active_cycles = [0 for _ in range(num_instances)]
     gpu_capacity_cycles = [0 for _ in range(num_instances)]
+    ranks_by_instance = [set() for _ in range(num_instances)]
+    for npu_id, inst_id in npu2inst_mapping.items():
+        ranks_by_instance[inst_id].add(npu_id)
+    pending_rank_reports = {}
+    latest_rank_reports = {}
     kv_pressure_score_peak = [0.0 for _ in range(num_instances)]
     input_tokens_total = [0 for _ in range(num_instances)]
     input_requests_total = [0 for _ in range(num_instances)]
@@ -802,12 +821,18 @@ def main():
         
         out = controller.read_wait(p)
         out_dicts = controller.parse_outputs(out)
-        out_dict = out_dicts[-1] if out_dicts else None
+        for timing in out_dicts:
+            latest_rank_reports[timing["sys"]] = timing
+        waiting = controller.parse_waiting(out)
+        if waiting is None:
+            raise RuntimeError("ASTRA-Sim did not identify the waiting NPU")
+        waiting_sys, current = waiting
+        out_dict = latest_rank_reports.get(waiting_sys)
+        if out_dict is None:
+            raise RuntimeError(f"ASTRA-Sim waiting NPU {waiting_sys} had no timing report")
         
-        if out_dict != None:
-            sys = out_dict['sys']
-            id = out_dict['id']
-            current = out_dict['cycle']
+        sys = out_dict['sys']
+        id = out_dict['id']
 
         # Route newly arrived requests to instances based on current load
         if dataset is not None:
@@ -816,15 +841,31 @@ def main():
         instance_id = npu2inst_mapping[sys]  # get instance id from NPU id
         node_id = inst2node_mapping[instance_id] # get node id from instance id
         for timing in out_dicts:
-            if timing["id"] <= 0 or timing["iteration_elapsed"] is None:
+            completed = _collect_completed_iteration(
+                pending_rank_reports,
+                ranks_by_instance,
+                npu2inst_mapping,
+                timing,
+            )
+            if completed is None:
                 continue
-            timing_instance = npu2inst_mapping[timing["sys"]]
-            iteration_elapsed_cycles[timing_instance] += timing["iteration_elapsed"]
-            if timing["comm_active"] is not None:
-                comm_active_cycles[timing_instance] += timing["comm_active"]
-            if timing["gpu_active"] is not None:
-                gpu_active_cycles[timing_instance] += timing["gpu_active"]
-                gpu_capacity_cycles[timing_instance] += timing["iteration_elapsed"]
+            timing_instance, reports = completed
+            iteration_elapsed_cycles[timing_instance] += sum(
+                report["iteration_elapsed"] for report in reports.values()
+            )
+            comm_active_cycles[timing_instance] += sum(
+                report["comm_active"] or 0 for report in reports.values()
+            )
+            gpu_reports = [
+                report for report in reports.values()
+                if report["gpu_active"] is not None
+            ]
+            gpu_active_cycles[timing_instance] += sum(
+                report["gpu_active"] for report in gpu_reports
+            )
+            gpu_capacity_cycles[timing_instance] += sum(
+                report["iteration_elapsed"] for report in gpu_reports
+            )
 
         # add stanby energy consumption for power modeling
         if power_modeling and sys == inst2npu_mapping[instance_id] and waiting_request[instance_id]:

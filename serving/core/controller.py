@@ -36,6 +36,14 @@ class Controller():
         p.stdin.flush()
         return
 
+    def parse_waiting(self, outputs):
+        """Return the NPU and simulator cycle waiting for a controller command."""
+        for line in reversed(outputs):
+            match = re.search(r"Waiting sys\[(\d+)\] cycle (\d+)", line)
+            if match:
+                return int(match.group(1)), int(match.group(2))
+        return None
+
     def parse_output(self, output):
         pattern = (
             r"sys\[(\d+)\] iteration (\d+) finished, (\d+) cycles, "

@@ -466,7 +466,8 @@ void Workload::call(EventType event, CallData* data) {
         (hw_resource->num_in_flight_gpu_comp_ops == 0) &&
         (hw_resource->num_in_flight_gpu_comm_ops == 0) &&
         (hw_resource->num_in_flight_gpu_comm_activity == 0) ) {
-        // report();
+        // Snapshot this completed graph before a queued graph resets its baseline.
+        report();
         if (!pending_workloads.empty()) {
             string next_workload = pending_workloads.front();
             pending_workloads.pop();
@@ -489,8 +490,6 @@ void Workload::call(EventType event, CallData* data) {
 
 void Workload::add_workload(const std::string& new_filename,
                             const std::vector<Sys*>& systems) {
-    managed_systems = systems;
-
     // add new workload filename to pending workloads in managed systems
     for (auto* managed_sys : systems) {
         if (managed_sys == nullptr || managed_sys->workload == nullptr) {
@@ -583,11 +582,6 @@ void Workload::begin_iteration() {
 }
 
 void Workload::report() {
-    for (auto* managed_sys : managed_systems) {
-        if (managed_sys != nullptr && managed_sys->workload != nullptr) {
-            managed_sys->workload->report();
-        }
-    }
     Tick curr_tick = Sys::boostedTick();
     hw_resource->update_activity(curr_tick);
     uint64_t elapsed = curr_tick - iteration_start_tick;
