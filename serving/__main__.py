@@ -1284,6 +1284,14 @@ def main():
                             gpu_capacity_cycles[inst_id],
                             gpu_capacity_cycles_last_sample[inst_id],
                         ),
+                        "sm_utilization": (
+                            100 * _interval_ratio(
+                                gpu_active_cycles[inst_id], gpu_active_cycles_last_sample[inst_id],
+                                gpu_capacity_cycles[inst_id], gpu_capacity_cycles_last_sample[inst_id],
+                            )
+                            if gpu_capacity_cycles[inst_id] > gpu_capacity_cycles_last_sample[inst_id]
+                            else None
+                        ),
                     }
                     _write_metrics_sample(
                         metrics_file,
@@ -1440,6 +1448,14 @@ def main():
                         comm_active_cycles[inst_idx], iteration_elapsed_cycles[inst_idx],
                         gpu_active_cycles[inst_idx], gpu_capacity_cycles[inst_idx],
                     )
+                    metrics["sm_utilization"] = (
+                        100 * _interval_ratio(
+                            gpu_active_cycles[inst_idx], gpu_active_cycles_last_sample[inst_idx],
+                            gpu_capacity_cycles[inst_idx], gpu_capacity_cycles_last_sample[inst_idx],
+                        )
+                        if gpu_capacity_cycles[inst_idx] > gpu_capacity_cycles_last_sample[inst_idx]
+                        else None
+                    )
                     if metrics_file is not None:
                         _write_metrics_sample(
                             metrics_file,
@@ -1517,6 +1533,14 @@ def main():
                 schedulers[inst_idx].pp_size,
                 gpu_active_cycles[inst_idx], gpu_active_cycles_last_sample[inst_idx],
                 gpu_capacity_cycles[inst_idx], gpu_capacity_cycles_last_sample[inst_idx],
+            )
+            metrics["sm_utilization"] = (
+                100 * _interval_ratio(
+                    gpu_active_cycles[inst_idx], gpu_active_cycles_last_sample[inst_idx],
+                    gpu_capacity_cycles[inst_idx], gpu_capacity_cycles_last_sample[inst_idx],
+                )
+                if gpu_capacity_cycles[inst_idx] > gpu_capacity_cycles_last_sample[inst_idx]
+                else None
             )
             _print_instance_metrics(inst_idx, schedulers[inst_idx], current, metrics=metrics)
             _write_metrics_sample(

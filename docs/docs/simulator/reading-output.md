@@ -14,6 +14,20 @@ The simulator produces three kinds of output:
 
 This page covers what each one means and how to read them.
 
+## Machine-readable telemetry
+
+Pass `--metrics-output outputs/metrics.jsonl` to write per-instance JSONL
+samples. `sm_utilization` is modeled accelerator busy time, not a physical
+DCGM SM counter:
+
+```text
+sm_utilization = 100 * delta_gpu_active_cycles / delta_gpu_capacity_cycles
+```
+
+It is `null` when ASTRA-Sim does not report active GPU cycles. Fleet
+aggregation should weight samples by their capacity-cycle denominator; do
+not average percentages across differently sized intervals or instances.
+
 ## Per-request CSV
 
 When you pass `--output outputs/foo.csv`, the simulator writes one
