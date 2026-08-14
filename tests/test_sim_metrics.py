@@ -18,6 +18,7 @@ from serving.__main__ import (
     _interval_ratio,
     _open_metrics_file,
     _print_instance_metrics,
+    _wall_time_budget,
     _write_metrics_sample,
 )
 from serving.core.controller import Controller
@@ -28,6 +29,11 @@ from serving.core.trace_generator import _trace_collective_wire_bytes
 
 
 class SimMetricsTest(unittest.TestCase):
+    def test_shared_deadline_shortens_each_process_budget(self):
+        self.assertEqual(_wall_time_budget(300, None, 1_000), 300)
+        self.assertEqual(_wall_time_budget(300, 1_250, 1_000), 250)
+        self.assertEqual(_wall_time_budget(300, 900, 1_000), 0)
+
     def test_total_kv_for_tokens_is_block_rounded(self):
         memory = MemoryModel.__new__(MemoryModel)
         memory.block_size = 16
