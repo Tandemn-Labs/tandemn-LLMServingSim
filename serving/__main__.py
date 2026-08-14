@@ -9,11 +9,12 @@ spawns the ASTRA-Sim subprocess, and runs the iteration loop:
 import argparse
 import atexit
 import json
+import math
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from time import time
+from time import monotonic, time
 from collections import defaultdict
 
 from serving.core.scheduler import *
@@ -69,6 +70,14 @@ def _pad_batch_to_max(batch, max_len):
 
 def _runtime_limit(value):
     return float('inf') if value == 0 else value
+
+
+def _wall_time_budget(max_seconds, deadline_epoch_seconds, now_epoch_seconds=None):
+    """Return the remaining wall budget without extending the per-run limit."""
+    if deadline_epoch_seconds is None:
+        return max_seconds
+    now_epoch_seconds = time() if now_epoch_seconds is None else now_epoch_seconds
+    return min(max_seconds, max(0.0, deadline_epoch_seconds - now_epoch_seconds))
 
 
 def _iteration_rate(current_count, previous_count, elapsed_ns):
@@ -166,14 +175,16 @@ def _print_instance_metrics(
     decode_itr_counts_per_second=None,
     comm_active_cycles=0, iteration_elapsed_cycles=0,
     gpu_active_cycles=0, gpu_capacity_cycles=0,
+    metrics=None,
 ):
-    metrics = _instance_metrics(
-        scheduler, current, comm_wire_bytes, scheduled_tokens,
-        input_length_observed, output_length_observed,
-        prefill_iteration_counts_per_second, decode_itr_counts_per_second,
-        comm_active_cycles, iteration_elapsed_cycles,
-        gpu_active_cycles, gpu_capacity_cycles,
-    )
+    if metrics is None:
+        metrics = _instance_metrics(
+            scheduler, current, comm_wire_bytes, scheduled_tokens,
+            input_length_observed, output_length_observed,
+            prefill_iteration_counts_per_second, decode_itr_counts_per_second,
+            comm_active_cycles, iteration_elapsed_cycles,
+            gpu_active_cycles, gpu_capacity_cycles,
+        )
     line = (
         f"SIM_METRICS instance={instance_id} "
         f"gpu_mem_used_fraction={metrics['gpu_mem_used_fraction']:.6f} "
@@ -512,6 +523,10 @@ def main():
                         help='KV cache data type: auto (use default profile.csv) or fp8 (use profile_fp8.csv, halves KV cache memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--max-wall-time-seconds', type=float, default=300,
+                        help='stop after this many wall-clock seconds and report completed requests only (default: 300)')
+    parser.add_argument('--wall-deadline-epoch-seconds', type=float, default=None,
+                        help='optional absolute Unix deadline shared by concurrent simulator processes')
 
     args = parser.parse_args()
     
@@ -522,6 +537,16 @@ def main():
     args.metrics_output = _resolve_output_file(args.metrics_output, args.run_id)
     if args.metrics_interval_seconds <= 0:
         parser.error('--metrics-interval-seconds must be positive')
+    if not math.isfinite(args.max_wall_time_seconds) or args.max_wall_time_seconds <= 0:
+        parser.error('--max-wall-time-seconds must be positive')
+    if (
+        args.wall_deadline_epoch_seconds is not None
+        and (
+            not math.isfinite(args.wall_deadline_epoch_seconds)
+            or args.wall_deadline_epoch_seconds <= 0
+        )
+    ):
+        parser.error('--wall-deadline-epoch-seconds must be positive')
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -716,6 +741,7 @@ def main():
             for sched in schedulers:
                 output = 64 if sched.is_encoder else 128
                 sched.add_request([i, sched.model, 64, output, 0, i % num_instances])
+    loaded_requests = router._next_request_id if dataset is not None else 16 * num_instances
 
     # Simulator start
     current = 0 # current tick of the system
@@ -769,6 +795,10 @@ def main():
     prefill_iterations_last_sample = [0 for _ in range(num_instances)]
     decode_iterations_last_sample = [0 for _ in range(num_instances)]
     metrics_last_sample_time = [0 for _ in range(num_instances)]
+    input_tokens_last_sample = [0 for _ in range(num_instances)]
+    input_requests_last_sample = [0 for _ in range(num_instances)]
+    output_tokens_last_sample = [0 for _ in range(num_instances)]
+    output_requests_last_sample = [0 for _ in range(num_instances)]
     comm_wire_bytes_last_sample = [0.0 for _ in range(num_instances)]
     comm_scheduled_tokens_last_sample = [0 for _ in range(num_instances)]
     comm_active_cycles_last_sample = [0 for _ in range(num_instances)]
@@ -796,7 +826,19 @@ def main():
         astra_args.append("--end-npu-ids="+end_npu_ids)
     if network_backend == 'ns3':
         astra_args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
-    p = subprocess.Popen(astra_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    wall_started_at = monotonic()
+    wall_deadline = wall_started_at + _wall_time_budget(
+        args.max_wall_time_seconds,
+        args.wall_deadline_epoch_seconds,
+    )
+    p = subprocess.Popen(
+        astra_args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+    )
+    run_status = "completed"
 
     # DP group synchronization: defer trace generation until all members have scheduled
     # dp_groups maps dp_group_name -> list of instance_ids
@@ -819,7 +861,11 @@ def main():
     # Starting simulation, one while loop processes one iteration
     while True:
         
-        out = controller.read_wait(p)
+        out = controller.read_wait(p, timeout=max(0, wall_deadline - monotonic()))
+        if out is None:
+            run_status = "wall_time_limit"
+            controller.stop(p)
+            break
         out_dicts = controller.parse_outputs(out)
         for timing in out_dicts:
             latest_rank_reports[timing["sys"]] = timing
@@ -913,8 +959,18 @@ def main():
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
             router.transfer_prefill_request(finished_reqs)
 
+        # Do not start a new batch after the wall-clock deadline.
+        if monotonic() >= wall_deadline:
+            run_status = "wall_time_limit"
+            controller.stop(p)
+            break
+
         # schedule requests
         new_req = schedulers[instance_id].schedule(current, sys, id)
+        if monotonic() >= wall_deadline:
+            run_status = "wall_time_limit"
+            controller.stop(p)
+            break
         kv_pressure_score_peak[instance_id] = max(
             kv_pressure_score_peak[instance_id],
             schedulers[instance_id].get_kv_pressure_score(),
@@ -992,6 +1048,10 @@ def main():
                                                                     workload_name=dp_workload_name,
                                                                     inputs_root=run_paths.inputs_root)
 
+                    if monotonic() >= wall_deadline:
+                        run_status = "wall_time_limit"
+                        controller.stop(p)
+                        break
                     dp_pending[dg].clear()
                     workload = get_workload(dummy, instances[instance_id]["hardware"], instance_id,
                                             workload_name=dp_workload_name,
@@ -1061,6 +1121,10 @@ def main():
                                                                         workload_name=dp_workload_name,
                                                                         inputs_root=run_paths.inputs_root)
 
+                        if monotonic() >= wall_deadline:
+                            run_status = "wall_time_limit"
+                            controller.stop(p)
+                            break
                         dp_pending[dg].clear()
                         workload = get_workload(new_req, instance["hardware"], instance_id,
                                                 workload_name=dp_workload_name,
@@ -1093,6 +1157,10 @@ def main():
                                    inst_cfg["enable_local_offloading"],
                                    inputs_root=run_paths.inputs_root,
                                    cleanup_trace=args.cleanup_inputs)
+                    if monotonic() >= wall_deadline:
+                        run_status = "wall_time_limit"
+                        controller.stop(p)
+                        break
                     workload = get_workload(new_req, instance["hardware"], instance_id,
                                             inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
@@ -1228,6 +1296,10 @@ def main():
                     prefill_iterations_last_sample[inst_id] = schedulers[inst_id].prefill_iterations
                     decode_iterations_last_sample[inst_id] = schedulers[inst_id].decode_iterations
                     metrics_last_sample_time[inst_id] = current
+                    input_tokens_last_sample[inst_id] = input_tokens_total[inst_id]
+                    input_requests_last_sample[inst_id] = input_requests_total[inst_id]
+                    output_tokens_last_sample[inst_id] = output_tokens_total[inst_id]
+                    output_requests_last_sample[inst_id] = output_requests_total[inst_id]
                     comm_wire_bytes_last_sample[inst_id] = comm_wire_bytes[inst_id]
                     comm_scheduled_tokens_last_sample[inst_id] = comm_scheduled_tokens[inst_id]
                     comm_active_cycles_last_sample[inst_id] = comm_active_cycles[inst_id]
@@ -1409,8 +1481,53 @@ def main():
     hours, remainder = divmod(total_time, 3600)
     minutes, seconds = divmod(remainder, 60)
 
-    # check all scheduled requests in astra-sim are well done
-    controller.check_end(p)
+    # ASTRA-Sim only emits its normal completion marker after a full run.
+    if run_status == "completed":
+        controller.check_end(p)
+    elif metrics_file is not None:
+        for inst_idx in range(num_instances):
+            sample_interval_ns = max(1, current - metrics_last_sample_time[inst_idx])
+            input_tokens = input_tokens_total[inst_idx] - input_tokens_last_sample[inst_idx]
+            input_requests = input_requests_total[inst_idx] - input_requests_last_sample[inst_idx]
+            output_tokens = output_tokens_total[inst_idx] - output_tokens_last_sample[inst_idx]
+            output_requests = output_requests_total[inst_idx] - output_requests_last_sample[inst_idx]
+            metrics = _instance_metrics(
+                schedulers[inst_idx], current,
+                comm_wire_bytes[inst_idx], comm_scheduled_tokens[inst_idx],
+                input_tokens / input_requests if input_requests else None,
+                output_tokens / output_requests if output_requests else None,
+                _iteration_rate(
+                    schedulers[inst_idx].prefill_iterations,
+                    prefill_iterations_last_sample[inst_idx], sample_interval_ns),
+                _iteration_rate(
+                    schedulers[inst_idx].decode_iterations,
+                    decode_iterations_last_sample[inst_idx], sample_interval_ns),
+                comm_active_cycles[inst_idx], iteration_elapsed_cycles[inst_idx],
+                gpu_active_cycles[inst_idx], gpu_capacity_cycles[inst_idx],
+            )
+            metrics["comm_overhead_pct"] = _interval_ratio(
+                comm_active_cycles[inst_idx], comm_active_cycles_last_sample[inst_idx],
+                iteration_elapsed_cycles[inst_idx], iteration_elapsed_cycles_last_sample[inst_idx],
+            )
+            metrics["per_tok_comm_bytes"] = _interval_ratio(
+                comm_wire_bytes[inst_idx], comm_wire_bytes_last_sample[inst_idx],
+                comm_scheduled_tokens[inst_idx], comm_scheduled_tokens_last_sample[inst_idx],
+            )
+            metrics["pipeline_bubble_fraction"] = _interval_pipeline_bubble(
+                schedulers[inst_idx].pp_size,
+                gpu_active_cycles[inst_idx], gpu_active_cycles_last_sample[inst_idx],
+                gpu_capacity_cycles[inst_idx], gpu_capacity_cycles_last_sample[inst_idx],
+            )
+            _print_instance_metrics(inst_idx, schedulers[inst_idx], current, metrics=metrics)
+            _write_metrics_sample(
+                metrics_file,
+                current,
+                "periodic",
+                inst_idx,
+                metrics,
+                sample_interval_ns,
+            )
+        metrics_file.close()
 
     # calcuate prefix caching metrics
     total_requested_tokens = 0
@@ -1435,6 +1552,28 @@ def main():
     
     # This is total system's throughput
     total_latency = current/FREQ
+    completed = [
+        request
+        for i in range(num_instances)
+        if instances[i]["pd_type"] != "prefill"
+        for request in schedulers[i].done
+    ]
+    completed_requests = len(completed)
+    admitted_request_ids = sorted(
+        set().union(*(scheduler.admitted_request_ids for scheduler in schedulers)))
+    total_prompt = sum(request.original_input for request in completed)
+    total_gen = sum(request.output - request.original_input for request in completed)
+    req_cnt = completed_requests
+    wall_elapsed_seconds = monotonic() - wall_started_at
+    print("SIM_RUN_SUMMARY " + json.dumps({
+        "status": run_status,
+        "loaded_requests": loaded_requests,
+        "completed_requests": completed_requests,
+        "unfinished_requests": max(0, loaded_requests - completed_requests),
+        "admitted_request_ids": admitted_request_ids,
+        "sim_time_ns": current,
+        "wall_elapsed_seconds": wall_elapsed_seconds,
+    }, separators=(",", ":")))
     print_rule()
     print_markup("[sim.heading]▶ Simulation results...[/]\n")
     print_markup(f"Total simulation time: {int(hours)}h {int(minutes)}m {seconds:.3f}s")
@@ -1444,10 +1583,10 @@ def main():
     print_markup(f"Total latency (s):                                                  {total_latency:.3f}")
     print_markup(f"Total input tokens:                                                 {total_prompt}")
     print_markup(f"Total generated tokens:                                             {total_gen}")
-    print_markup(f"Request throughput (req/s):                                         {req_cnt/total_latency:.2f}")
-    print_markup(f"Average prompt throughput (tok/s):                                  {total_prompt/total_latency:.2f}")
-    print_markup(f"Average generation throughput (tok/s):                              {total_gen/total_latency:.2f}")
-    print_markup(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
+    print_markup(f"Request throughput (req/s):                                         {req_cnt / total_latency if total_latency else 0:.2f}")
+    print_markup(f"Average prompt throughput (tok/s):                                  {total_prompt / total_latency if total_latency else 0:.2f}")
+    print_markup(f"Average generation throughput (tok/s):                              {total_gen / total_latency if total_latency else 0:.2f}")
+    print_markup(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen) / total_latency if total_latency else 0:.2f}")
     print_markup(f"Throughput per {1/RATIO} sec (\\[prompt_throughput], \\[gen_throughput]): {throughput}")
     print_rule()
     if any_prefix_caching:

@@ -1,33 +1,74 @@
+import os
 import re
+import selectors
+import subprocess
+from time import monotonic
 from .logger import get_logger
 
 class Controller():
     def __init__(self, total_num):
         self.end_dict = {}
         self.total_num = total_num
+        self._stdout_buffer = ""
         self.logger = get_logger(self.__class__)
         for i in range(total_num):
             self.end_dict[i] = -1
 
 
-    def read_wait(self, p):
+    def _read_line(self, p, deadline=None):
+        while "\n" not in self._stdout_buffer:
+            timeout = None if deadline is None else max(0, deadline - monotonic())
+            if timeout is not None:
+                ready = selectors.DefaultSelector()
+                try:
+                    ready.register(p.stdout, selectors.EVENT_READ)
+                    if not ready.select(timeout):
+                        return None
+                finally:
+                    ready.close()
+            chunk = os.read(p.stdout.fileno(), 4096)
+            if not chunk:
+                raise RuntimeError(f"ASTRA-Sim exited unexpectedly with code {p.poll()}")
+            self._stdout_buffer += chunk.decode()
+        line, self._stdout_buffer = self._stdout_buffer.split("\n", 1)
+        return line + "\n"
+
+    def read_wait(self, p, timeout=None):
+        """Read through the next ASTRA-Sim wait point, or return None on timeout."""
         out = [""]
+        deadline = monotonic() + timeout if timeout is not None else None
         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
-            line = p.stdout.readline()
-            # For debugging
-            # print(line, end='')
+            line = self._read_line(p, deadline)
+            if line is None:
+                return None
             out.append(line)
-            p.stdout.flush()
         return out
 
-    def check_end(self, p):
-        out = ["",""]
-        while out[-2] != "All Request Has Been Exited\n" and out[-2] != "ERROR: Some Requests Remain\n":
-            out.append(p.stdout.readline())
-            p.stdout.flush()
-        print(out[-4], end='')
-        print(out[-2], end='')
-        return out
+    def stop(self, p, grace_seconds=5):
+        """Stop ASTRA-Sim after an intentional partial simulation cutoff."""
+        if p.poll() is not None:
+            return
+        p.terminate()
+        try:
+            p.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+    def check_end(self, p, timeout=5):
+        deadline = monotonic() + timeout
+        out = []
+        while True:
+            line = self._read_line(p, deadline)
+            if line is None:
+                raise TimeoutError("ASTRA-Sim did not finish within the completion grace period")
+            out.append(line)
+            if line == "All Request Has Been Exited\n":
+                print(out[-2] if len(out) > 1 else "", end='')
+                print(line, end='')
+                return out
+            if line == "ERROR: Some Requests Remain\n":
+                raise RuntimeError("ASTRA-Sim reported unfinished requests")
 
     def write_flush(self, p, input):
         # For debugging

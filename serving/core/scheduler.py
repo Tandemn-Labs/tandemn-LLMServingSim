@@ -58,6 +58,7 @@ class Scheduler:
         self.request = []
         self.inflight = []
         self.done = []
+        self.admitted_request_ids = set()
         self.batch_ids = -1
         self.prefill_iterations = 0
         self.decode_iterations = 0
@@ -71,11 +72,14 @@ class Scheduler:
  
     def schedule(self, current, sys, batch_id=-1):
         if self.is_encoder:
-            return self.schedule_encoder(current, sys, batch_id)
-        if self.enable_prefix_caching:
-            return self.schedule_with_prefix(current, sys, batch_id)
+            batch = self.schedule_encoder(current, sys, batch_id)
+        elif self.enable_prefix_caching:
+            batch = self.schedule_with_prefix(current, sys, batch_id)
         else:
-            return self.schedule_base(current, sys, batch_id)
+            batch = self.schedule_base(current, sys, batch_id)
+        if batch is not None and sys == self.start_npu:
+            self.admitted_request_ids.update(req.id for req in batch.requests if req.is_init)
+        return batch
 
     def get_kv_pressure_score(self):
         """Return peak requested KV demand divided by modeled KV capacity."""
