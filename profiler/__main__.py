@@ -102,6 +102,10 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
                         "Default: vLLM default.")
     p.add_argument("--kv-cache-dtype", default=None,
                    help="KV cache dtype (auto/fp8/fp16/bf16). Default: auto.")
+    p.add_argument("--attention-backend", default=None,
+                   dest="attention_backend",
+                   help="vLLM attention backend (for example, TRITON_ATTN). "
+                        "Default: vLLM selection.")
     p.add_argument("--max-num-batched-tokens", type=int, default=None,
                    dest="max_num_batched_tokens",
                    help="Per-step token budget. Matches vLLM's own "
@@ -323,6 +327,7 @@ def _build_profile_args(
         variant=ns.variant,
         dtype=ns.dtype,
         kv_cache_dtype=ns.kv_cache_dtype,
+        attention_backend=ns.attention_backend,
         max_num_batched_tokens=ns.max_num_batched_tokens,
         max_num_seqs=ns.max_num_seqs,
         attention_max_kv=ns.attention_max_kv,

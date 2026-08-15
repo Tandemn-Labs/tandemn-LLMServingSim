@@ -54,6 +54,10 @@ Workload::Workload(Sys* sys, string et_filename, string comm_group_filename) {
     this->iteration = 0;
     this->filename = et_filename;
     this->is_sleep = false;
+    this->iteration_start_tick = 0;
+    this->iteration_start_compute_ticks = 0;
+    this->iteration_start_comm_ticks = 0;
+    this->iteration_start_active_ticks = 0;
 }
 
 Workload::~Workload() {
@@ -123,6 +127,7 @@ void Workload::issue_dep_free_nodes() {
 void Workload::issue(shared_ptr<Chakra::ETFeederNode> node) {
     auto logger = LoggerFactory::get_logger("workload");
     if (sys->replay_only) {
+        hw_resource->update_activity(Sys::boostedTick());
         hw_resource->occupy(node);
         issue_replay(node);
     } else {
@@ -243,6 +248,7 @@ void Workload::issue_mem(shared_ptr<Chakra::ETFeederNode> node) {
 }
 
 void Workload::issue_comp(shared_ptr<Chakra::ETFeederNode> node) {
+    hw_resource->update_activity(Sys::boostedTick());
     hw_resource->occupy(node);
 
     if (sys->roofline_enabled) {
@@ -270,6 +276,7 @@ void Workload::issue_comp(shared_ptr<Chakra::ETFeederNode> node) {
 }
 
 void Workload::issue_comm(shared_ptr<Chakra::ETFeederNode> node) {
+    hw_resource->update_activity(Sys::boostedTick());
     hw_resource->occupy(node);
 
     vector<bool> involved_dim;
@@ -413,6 +420,7 @@ void Workload::call(EventType event, CallData* data) {
                         static_cast<uint64_t>(node->type()));
         }
 
+        hw_resource->update_activity(Sys::boostedTick());
         hw_resource->release(node);
 
         et_feeder->freeChildrenNodes(node_id);
@@ -441,6 +449,7 @@ void Workload::call(EventType event, CallData* data) {
                             node->name(), static_cast<uint64_t>(node->type()));
             }
 
+            hw_resource->update_activity(Sys::boostedTick());
             hw_resource->release(node);
 
             et_feeder->freeChildrenNodes(node->id());
@@ -455,8 +464,10 @@ void Workload::call(EventType event, CallData* data) {
     if (!et_feeder->hasNodesToIssue() &&
         (hw_resource->num_in_flight_cpu_ops == 0) &&
         (hw_resource->num_in_flight_gpu_comp_ops == 0) &&
-        (hw_resource->num_in_flight_gpu_comm_ops == 0) ) {
-        // report();
+        (hw_resource->num_in_flight_gpu_comm_ops == 0) &&
+        (hw_resource->num_in_flight_gpu_comm_activity == 0) ) {
+        // Snapshot this completed graph before a queued graph resets its baseline.
+        report();
         if (!pending_workloads.empty()) {
             string next_workload = pending_workloads.front();
             pending_workloads.pop();
@@ -479,7 +490,6 @@ void Workload::call(EventType event, CallData* data) {
 
 void Workload::add_workload(const std::string& new_filename,
                             const std::vector<Sys*>& systems) {
-
     // add new workload filename to pending workloads in managed systems
     for (auto* managed_sys : systems) {
         if (managed_sys == nullptr || managed_sys->workload == nullptr) {
@@ -558,12 +568,33 @@ void Workload::sleep_workload(const std::vector<Sys*>& systems) {
 }
 
 void Workload::fire() {
+    begin_iteration();
     call(EventType::General, NULL);
+}
+
+void Workload::begin_iteration() {
+    uint64_t tick = Sys::boostedTick();
+    hw_resource->update_activity(tick);
+    iteration_start_tick = tick;
+    iteration_start_compute_ticks = hw_resource->active_gpu_compute_ticks;
+    iteration_start_comm_ticks = hw_resource->active_gpu_comm_ticks;
+    iteration_start_active_ticks = hw_resource->active_gpu_ticks;
 }
 
 void Workload::report() {
     Tick curr_tick = Sys::boostedTick();
+    hw_resource->update_activity(curr_tick);
+    uint64_t elapsed = curr_tick - iteration_start_tick;
+    uint64_t compute_active =
+        hw_resource->active_gpu_compute_ticks - iteration_start_compute_ticks;
+    uint64_t comm_active =
+        hw_resource->active_gpu_comm_ticks - iteration_start_comm_ticks;
+    uint64_t gpu_active =
+        hw_resource->active_gpu_ticks - iteration_start_active_ticks;
     LoggerFactory::get_logger("workload")
-        ->info("sys[{}] iteration {} finished, {} cycles, exposed communication {} cycles.",
-               sys->id, iteration, curr_tick, curr_tick - hw_resource->tics_gpu_ops);
+        ->info("sys[{}] iteration {} finished, {} cycles, exposed communication {} cycles. "
+               "iteration elapsed {} cycles, active compute {} cycles, "
+               "active communication {} cycles, active GPU {} cycles.",
+               sys->id, iteration, curr_tick, curr_tick - hw_resource->tics_gpu_ops,
+               elapsed, compute_active, comm_active, gpu_active);
 }

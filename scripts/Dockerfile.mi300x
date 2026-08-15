@@ -1,0 +1,8 @@
+FROM rocm/vllm:rocm7.13.0_gfx94X-dcgpu_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1@sha256:75503c82b8a1d3c970b19d1ac1a3e3c96436aab6d3695580527f8581694f3b2d
+
+# The profiler relies on the vLLM model-runner API used by its worker extension.
+ENV VLLM_USE_V2_MODEL_RUNNER=0
+
+WORKDIR /workspace
+ENTRYPOINT ["/bin/bash", "-lc"]
+CMD ["exec sleep infinity"]

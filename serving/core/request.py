@@ -29,6 +29,9 @@ class Request:
         self.prefix_cache_hit = 0
         self.npu_cache_hit = 0
         self.storage_cache_hit = 0
+        self.npu_prefix_hit_tokens = 0
+        self.prefix_cache_requested_tokens = input
+        self.prefix_cache_hit_ratio = 0.0
         self.npu_last_node = None
         self.cpu_last_node = None
         self.storage_last_node = None
@@ -37,6 +40,7 @@ class Request:
         self._prefix_locked = False
         self._prefix_npu_stats_counted = False
         self._prefix_storage_stats_counted = False
+        self._prefix_cache_match_recorded = False
 
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = None

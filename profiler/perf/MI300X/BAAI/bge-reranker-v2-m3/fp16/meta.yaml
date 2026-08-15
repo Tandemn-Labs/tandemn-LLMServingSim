@@ -1,0 +1,46 @@
+profiler_version: 1.0.0
+vllm_version: 0.19.1+rocm7.13.0rc2
+cuda_version: unknown
+gpu: AMD Instinct MI300X
+# Profiled with MI300X-ROCm7.13-TRITON-RUNPOD.
+hardware: MI300X
+profiled_at: '2026-08-10T07:55:44+00:00'
+architecture: xlm-roberta
+architecture_sha256: 792d3991489a56bde932bac70c956b95043530160a08b5de5e43e1af7d8edbd4
+model: BAAI/bge-reranker-v2-m3
+variant: fp16
+tp_degrees: [1]
+engine_effective:
+  load_format: dummy
+  enforce_eager: true
+  skip_tokenizer_init: true
+  enable_prefix_caching: false
+  tensor_parallel_size: 1
+  block_size: 16
+  gpu_memory_utilization: 0.9
+  max_num_batched_tokens: 8192
+  max_num_seqs: 256
+  hf_overrides:
+    num_hidden_layers: 1
+    intermediate_size: 4096
+    num_attention_heads: 16
+    vocab_size: 250002
+    head_dim: 64
+  dtype: float16
+  attention_backend: TRITON_ATTN
+  max_model_len: 8192
+  runner: pooling
+  pooler_config: PoolerConfig(task='classify', pooling_type=None, seq_pooling_type='CLS',
+    tok_pooling_type='ALL', use_activation=None, dimensions=None, enable_chunked_processing=False,
+    max_embed_len=8192, logit_bias=None, step_tag_id=None, returned_token_ids=None)
+  worker_extension_cls: profiler.core.hooks.extension.Extension
+  model: /tmp/profiler_model_fhf50udi
+measurement_iterations: 3
+encoder_grid:
+  max_tokens: 8192
+  max_sequences: 256
+  max_model_len: 8192
+skew_profile:
+  enabled: false
+skew_fit:
+  enabled: false

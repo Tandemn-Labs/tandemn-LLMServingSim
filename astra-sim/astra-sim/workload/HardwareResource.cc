@@ -17,7 +17,8 @@ HardwareResource::HardwareResource(uint32_t num_npus)
     : num_npus(num_npus),
       num_in_flight_cpu_ops(0),
       num_in_flight_gpu_comm_ops(0),
-      num_in_flight_gpu_comp_ops(0) {
+      num_in_flight_gpu_comp_ops(0),
+      num_in_flight_gpu_comm_activity(0) {
 
     num_cpu_ops = 0;
     num_gpu_ops = 0;
@@ -26,11 +27,31 @@ HardwareResource::HardwareResource(uint32_t num_npus)
     tics_cpu_ops = 0;
     tics_gpu_ops = 0;
     tics_gpu_comms = 0;
+    active_gpu_compute_ticks = 0;
+    active_gpu_comm_ticks = 0;
+    active_gpu_ticks = 0;
+    last_activity_tick = 0;
 
     cpu_ops_node = NULL;
     gpu_ops_node = NULL;
     gpu_comms_node = NULL;
 
+}
+
+void HardwareResource::update_activity(uint64_t tick) {
+    assert(tick >= last_activity_tick);
+    uint64_t elapsed = tick - last_activity_tick;
+    if (num_in_flight_gpu_comp_ops > 0) {
+        active_gpu_compute_ticks += elapsed;
+    }
+    if (num_in_flight_gpu_comm_activity > 0) {
+        active_gpu_comm_ticks += elapsed;
+    }
+    if (num_in_flight_gpu_comp_ops > 0 ||
+        num_in_flight_gpu_comm_activity > 0) {
+        active_gpu_ticks += elapsed;
+    }
+    last_activity_tick = tick;
 }
 
 void HardwareResource::occupy(const shared_ptr<Chakra::ETFeederNode> node) {
@@ -45,12 +66,13 @@ void HardwareResource::occupy(const shared_ptr<Chakra::ETFeederNode> node) {
             ++num_gpu_ops;
             gpu_ops_node = node;
         } else {
-            if (node->type() == ChakraNodeType::COMM_RECV_NODE){
+            if (node->type() == ChakraNodeType::MEM_LOAD_NODE ||
+                node->type() == ChakraNodeType::MEM_STORE_NODE ||
+                node->type() == ChakraNodeType::PIM_COMP_NODE) {
                 return;
             }
-            else if (node->type() == ChakraNodeType::MEM_LOAD_NODE ||
-                     node->type() == ChakraNodeType::MEM_STORE_NODE ||
-                     node->type() == ChakraNodeType::PIM_COMP_NODE) {
+            ++num_in_flight_gpu_comm_activity;
+            if (node->type() == ChakraNodeType::COMM_RECV_NODE) {
                 return;
             }
             assert(num_in_flight_gpu_comm_ops == 0);
@@ -70,11 +92,14 @@ void HardwareResource::release(const shared_ptr<Chakra::ETFeederNode> node) {
             --num_in_flight_gpu_comp_ops;
             assert(num_in_flight_gpu_comp_ops == 0);
         } else {
-            if (node->type() == ChakraNodeType::COMM_RECV_NODE){
+            if (node->type() == ChakraNodeType::MEM_LOAD_NODE ||
+                node->type() == ChakraNodeType::MEM_STORE_NODE ||
+                node->type() == ChakraNodeType::PIM_COMP_NODE) {
                 return;
-            } else if (node->type() == ChakraNodeType::MEM_LOAD_NODE ||
-                       node->type() == ChakraNodeType::MEM_STORE_NODE ||
-                       node->type() == ChakraNodeType::PIM_COMP_NODE) {
+            }
+            assert(num_in_flight_gpu_comm_activity > 0);
+            --num_in_flight_gpu_comm_activity;
+            if (node->type() == ChakraNodeType::COMM_RECV_NODE) {
                 return;
             }
             --num_in_flight_gpu_comm_ops;

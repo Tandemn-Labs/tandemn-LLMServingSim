@@ -50,6 +50,7 @@ for MODEL in "${MODELS[@]}"; do
     [[ -n "${FORCE:-}" ]]                  && cmd+=(--force)
     [[ -n "${DTYPE:-}" ]]                  && cmd+=(--dtype "$DTYPE")
     [[ -n "${KV_CACHE_DTYPE:-}" ]]         && cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+    [[ -n "${ATTENTION_BACKEND:-}" ]]      && cmd+=(--attention-backend "$ATTENTION_BACKEND")
     [[ -n "${VARIANT:-}" ]]                && cmd+=(--variant "$VARIANT")
     [[ -n "${VERBOSITY:-}" ]]              && cmd+=($VERBOSITY)
 

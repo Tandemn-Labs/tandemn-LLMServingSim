@@ -65,6 +65,8 @@ matching runtime knobs per `instances[i]`; see
 | `--dataset` | path | `None` | JSONL workload file. See **[Workloads → JSONL format](/docs/workloads/jsonl-format)** |
 | `--num-reqs` | int | `0` | Entries to load from the dataset (`0` = all). For agentic, each entry is a session |
 | `--output` | path | `None` | Per-request CSV output path. Stdout only if `None`. The literal `{run_id}` is replaced with the active run id |
+| `--max-wall-time-seconds` | float | `300` | Stop the one-shot simulator at this wall-clock deadline. The CSV and latency summaries include only completed requests; stdout emits a `SIM_RUN_SUMMARY` with the completed and unfinished counts |
+| `--wall-deadline-epoch-seconds` | float | `None` | Optional absolute Unix deadline shared by concurrent simulator processes. A process uses the shorter of this deadline and `--max-wall-time-seconds` |
 
 ## Run isolation
 

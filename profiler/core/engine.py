@@ -119,6 +119,8 @@ def _profile_engine_overrides(args: ProfileArgs) -> dict[str, Any]:
         out["dtype"] = args.dtype
     if args.kv_cache_dtype is not None:
         out["kv_cache_dtype"] = args.kv_cache_dtype
+    if args.attention_backend is not None:
+        out["attention_backend"] = args.attention_backend
     if args.max_num_batched_tokens is not None:
         out["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.max_num_seqs is not None:

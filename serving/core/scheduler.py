@@ -58,7 +58,10 @@ class Scheduler:
         self.request = []
         self.inflight = []
         self.done = []
+        self.admitted_request_ids = set()
         self.batch_ids = -1
+        self.prefill_iterations = 0
+        self.decode_iterations = 0
 
         # memory model
         self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
@@ -69,11 +72,30 @@ class Scheduler:
  
     def schedule(self, current, sys, batch_id=-1):
         if self.is_encoder:
-            return self.schedule_encoder(current, sys, batch_id)
-        if self.enable_prefix_caching:
-            return self.schedule_with_prefix(current, sys, batch_id)
+            batch = self.schedule_encoder(current, sys, batch_id)
+        elif self.enable_prefix_caching:
+            batch = self.schedule_with_prefix(current, sys, batch_id)
         else:
-            return self.schedule_base(current, sys, batch_id)
+            batch = self.schedule_base(current, sys, batch_id)
+        if batch is not None and sys == self.start_npu:
+            self.admitted_request_ids.update(req.id for req in batch.requests if req.is_init)
+        return batch
+
+    def get_kv_pressure_score(self):
+        """Return peak requested KV demand divided by modeled KV capacity."""
+        requests = {req.id: req for req in self.request}
+        for batch in self.inflight:
+            for req in batch.requests:
+                requests[req.id] = req
+
+        demand = sum(
+            self.memory.get_total_kv_for_tokens(req.output)
+            for req in requests.values()
+        )
+        capacity = self.memory.npu_mem - self.memory.weight
+        if capacity <= 0:
+            return float('inf') if demand else 0.0
+        return demand / capacity
 
     def schedule_encoder(self, current, sys, batch_id=-1):
         """Pack complete encoder requests into a single one-shot batch."""
@@ -774,7 +796,11 @@ class Scheduler:
             "Batch #%d is done",
             batch.batch_id,
         )
-                
+        if batch.requests and batch.prefill_q_list:
+            self.prefill_iterations += 1
+        if batch.requests and batch.decode_k_list:
+            self.decode_iterations += 1
+
         pool = []
         for req in batch.requests:
             # For chunked prefill, use computed tokens to determine prefill vs decode
@@ -1049,8 +1075,10 @@ class Scheduler:
             # Write the column headers
             if not is_append:
                 writer.writerow(['instance id', 'request id', 'model', 'input', 'output',
-                                'arrival', 'end_time', 'latency', 
-                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
+                                 'arrival', 'end_time', 'latency',
+                                 'queuing_delay', 'TTFT', 'TPOT', 'ITL',
+                                 'npu_prefix_hit_tokens', 'prefix_cache_requested_tokens',
+                                 'prefix_cache_hit_ratio'])
             
             # Write each request's information
             for req in self.done:
@@ -1066,7 +1094,10 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.itl
+                    req.itl,
+                    req.npu_prefix_hit_tokens,
+                    req.prefix_cache_requested_tokens,
+                    req.prefix_cache_hit_ratio,
                 ])
 
 

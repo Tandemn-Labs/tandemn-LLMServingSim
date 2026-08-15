@@ -10,6 +10,7 @@ LICENSE file in the root directory of this source tree.
 #include <string>
 #include <unordered_map>
 #include <queue>
+#include <vector>
 
 #include "astra-sim/system/Callable.hh"
 #include "astra-sim/system/CommunicatorGroup.hh"
@@ -44,6 +45,7 @@ class Workload : public Callable {
     void fire();
     void add_workload(const std::string& new_filename, const std::vector<Sys*>& systems);
     void sleep_workload(const std::vector<Sys*>& systems);
+    void begin_iteration();
 
     // stats
     void report();
@@ -60,6 +62,10 @@ class Workload : public Callable {
 
     bool is_sleep;
     std::queue<std::string> pending_workloads;
+    uint64_t iteration_start_tick;
+    uint64_t iteration_start_compute_ticks;
+    uint64_t iteration_start_comm_ticks;
+    uint64_t iteration_start_active_ticks;
 };
 
 }  // namespace AstraSim

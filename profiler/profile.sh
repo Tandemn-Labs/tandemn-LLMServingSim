@@ -45,6 +45,7 @@ TP_DEGREES="1,2"
 # KV_CACHE_DTYPE defaults to "auto" which inherits DTYPE.
 # DTYPE="bfloat16"                 # bfloat16 / float16 / float32 / fp8
 # KV_CACHE_DTYPE="fp8"             # auto / fp8 / fp16 / bf16
+# ATTENTION_BACKEND="TRITON_ATTN"   # optional vLLM backend override
 MAX_NUM_BATCHED_TOKENS=2048      # vLLM's --max-num-batched-tokens
 MAX_NUM_SEQS=256                 # vLLM's --max-num-seqs
 
@@ -117,6 +118,7 @@ cmd=(python3 -m profiler profile "$MODEL" --hardware "$HARDWARE")
 [[ -n "${TP_DEGREES:-}" ]]             && cmd+=(--tp "$TP_DEGREES")
 [[ -n "${DTYPE:-}" ]]                  && cmd+=(--dtype "$DTYPE")
 [[ -n "${KV_CACHE_DTYPE:-}" ]]         && cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+[[ -n "${ATTENTION_BACKEND:-}" ]]      && cmd+=(--attention-backend "$ATTENTION_BACKEND")
 [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]] && cmd+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
 [[ -n "${MAX_NUM_SEQS:-}" ]]           && cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
 [[ -n "${ATTENTION_MAX_KV:-}" ]]       && cmd+=(--attention-max-kv "$ATTENTION_MAX_KV")

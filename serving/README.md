@@ -37,6 +37,14 @@ The simulation loop in `serving/__main__.py` orchestrates these modules per iter
 5. **Controller** feeds graphs to ASTRA-Sim and reads back timing results
 6. **Memory model** tracks KV cache allocation, eviction, and prefix cache hits
 
+## TODO
+
+- ASTRA-Sim can report `ERROR: Some Requests Remain` after some TP4/TP8 MoE
+  traces, leaving a terminal `MEM_STORE_NODE_sampler_*_OUTPUT` node unfinished.
+  The current backend completion check does not track in-flight memory operations;
+  fix it by including memory requests in workload completion accounting. Treat such
+  runs as invalid until then.
+
 ### Trace generation pipeline
 
 The trace generator constructs per-iteration execution traces by walking the

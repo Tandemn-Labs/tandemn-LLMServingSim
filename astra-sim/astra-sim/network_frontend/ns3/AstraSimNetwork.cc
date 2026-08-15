@@ -404,8 +404,8 @@ int main(int argc, char* argv[]) {
         Simulator::RunOneEvent();
         for (int i = 0; i < num_npus; i++) {
             if(systems[i]->workload->is_finished){
-                systems[i]->workload->report();
-                AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
+                AstraSim::LoggerFactory::get_logger("workload")
+                    ->info("Waiting sys[{}] cycle {}", i, Sys::boostedTick());
                 string new_filename;
                 getline(cin, new_filename);
                 if (new_filename.compare("pass") == 0){ // if pass
