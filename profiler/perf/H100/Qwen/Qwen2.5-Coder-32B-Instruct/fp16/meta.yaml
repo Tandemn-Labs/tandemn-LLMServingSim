@@ -7,9 +7,10 @@ profiled_at: '2026-07-30T02:52:31+00:00'
 architecture: qwen2
 architecture_sha256: 65c03cebae04f3734421e8e876dfbc91d9aca56b35b59f2b3cf192f265e53f42
 model: Qwen/Qwen2.5-Coder-32B-Instruct
-variant: bf16
+variant: fp16
 tp_degrees: [1, 2, 4, 8]
 engine_effective:
+  dtype: float16
   load_format: dummy
   enforce_eager: true
   skip_tokenizer_init: true
