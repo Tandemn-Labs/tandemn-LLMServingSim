@@ -25,7 +25,10 @@ from serving.core.controller import Controller
 from serving.core.memory_model import MemoryModel
 from serving.core.request import Request
 from serving.core.scheduler import Scheduler
-from serving.core.trace_generator import _trace_collective_wire_bytes
+from serving.core.trace_generator import (
+    _pp_stage_boundaries,
+    _trace_collective_wire_bytes,
+)
 
 
 class SimMetricsTest(unittest.TestCase):
@@ -75,6 +78,15 @@ class SimMetricsTest(unittest.TestCase):
         ]
 
         self.assertEqual(_trace_collective_wire_bytes(rows, tp_size=4, ep_total=2), 230)
+
+    def test_pipeline_stages_start_on_transformer_block_boundaries(self):
+        block_starts = [1, 10, 20, 30, 40]
+
+        self.assertEqual(_pp_stage_boundaries(block_starts, 1), [])
+        self.assertEqual(_pp_stage_boundaries(block_starts, 2), [30])
+        self.assertEqual(_pp_stage_boundaries(block_starts, 4), [10, 20, 40])
+        with self.assertRaisesRegex(ValueError, "pipeline stage cannot be empty"):
+            _pp_stage_boundaries(block_starts, 6)
 
     def test_controller_parses_all_npu_timing_reports(self):
         controller = Controller(2)
