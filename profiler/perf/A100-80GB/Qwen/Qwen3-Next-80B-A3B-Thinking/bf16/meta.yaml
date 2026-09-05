@@ -8,7 +8,7 @@ architecture: qwen3_next
 architecture_sha256: 58e3c71331c0312285ee32eac7dd9d143d0bef9e56a8fc486ecca0439ebaaf62
 model: Qwen/Qwen3-Next-80B-A3B-Thinking
 variant: bf16
-tp_degrees: [4]
+tp_degrees: [4, 8]
 engine_effective:
   load_format: dummy
   enforce_eager: true

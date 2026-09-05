@@ -8,7 +8,7 @@ architecture: mixtral
 architecture_sha256: a13e97ef49bf70de8ed511e73113d6f3896b86935c8040423e86dfd3b444e097
 model: mistralai/Mixtral-8x7B-Instruct-v0.1
 variant: fp16
-tp_degrees: [4]
+tp_degrees: [4, 8]
 engine_effective:
   load_format: dummy
   enforce_eager: true

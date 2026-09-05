@@ -8,7 +8,7 @@ architecture: glm4_moe
 architecture_sha256: 72ae362a1dbb8967133aa4ff846e459ed99618be49fbe918eddc69172af8883a
 model: zai-org/GLM-4.5-Air
 variant: bf16
-tp_degrees: [4]
+tp_degrees: [4, 8]
 engine_effective:
   load_format: dummy
   enforce_eager: true

@@ -8,7 +8,7 @@ architecture: phi3
 architecture_sha256: b13e7309b2eba17a42dd16bb6fda812dc320233548fb0d96573271cc2dbdb9f5
 model: microsoft/phi-4
 variant: fp16
-tp_degrees: [1]
+tp_degrees: [1, 2]
 engine_effective:
   load_format: dummy
   enforce_eager: true
